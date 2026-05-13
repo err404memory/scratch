@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self' qrc:; script-src 'self' qrc:; style-src 'self' 'unsafe-inline';">
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; background: #0f1115; }
+
+#preview-frame {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
+}
+
+#editor-shell {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 140ms ease;
+}
+body.edit-mode #editor-shell {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+#editor {
+    width: 100%;
+    height: 100%;
+    background: #0d1117;
+    color: #e6edf3;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    padding: 14px 16px;
+    border: none;
+    resize: none;
+    outline: none;
+    caret-color: #7cc4ff;
+    overflow-y: overlay;
+}
+#editor::placeholder { color: #3d4450; }
+
+#editor::-webkit-scrollbar { width: 0; height: 0; }
+
+#preview-overlay {
+    position: absolute;
+    inset: 0;
+    cursor: text;
+    z-index: 1;
+}
+body.edit-mode #preview-overlay {
+    display: none;
+}
+</style>
+</head>
+<body>
+<iframe id="preview-frame"></iframe>
+<div id="preview-overlay"></div>
+<div id="editor-shell">
+  <textarea id="editor" placeholder="Write HTML / CSS…"></textarea>
+</div>
+
+<script>
+"use strict";
+
+const frame  = document.getElementById('preview-frame');
+const editor = document.getElementById('editor');
+
+let _editMode = false;
+let _content  = '';
+let _bgColor  = '';
+
+function buildWrapper(bodyHtml) {
+    const bg = _bgColor || 'linear-gradient(160deg,#f8f6f1 0%,#edeae0 100%)';
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+  body{background:${bg};color:#1c2430;
+    font-family:Inter,system-ui,sans-serif;font-size:13px;line-height:1.6;
+    margin:0;padding:18px 20px;min-height:100vh;}
+  h1,h2,h3{color:#16324f;margin:.2em 0 .5em;line-height:1.2;}
+  h1{font-size:1.45rem;}h2{font-size:1.2rem;}h3{font-size:1rem;}
+  p,ul,ol,pre,blockquote,details{margin:.7em 0;}
+  a{color:#5c7cfa;}
+  code{background:rgba(22,50,79,.09);color:#0f3b63;padding:1px 5px;border-radius:4px;
+    font-family:ui-monospace,monospace;}
+  pre{background:#15202b;color:#d7e0ea;padding:14px;border-radius:10px;overflow:auto;}
+  pre code{background:transparent;color:inherit;padding:0;}
+  blockquote{border-left:4px solid #9aacb8;padding-left:12px;color:#4e5968;}
+  table{border-collapse:collapse;}td,th{border:1px solid rgba(35,44,58,.15);padding:4px 8px;}
+  img{max-width:100%;}
+  details{border:1px solid rgba(35,44,58,.15);border-radius:8px;padding:8px 12px;}
+  summary{cursor:pointer;font-weight:600;color:#16324f;}
+  ::-webkit-scrollbar{width:0;height:0;}
+</style></head><body>${bodyHtml}</body></html>`;
+}
+
+function renderPreview(html) {
+    const isFullDoc = /^\s*<!doctype|^\s*<html/i.test(html);
+    frame.srcdoc = html
+        ? (isFullDoc ? html : buildWrapper(html))
+        : buildWrapper('<p style="color:#9aa0ab;font-style:italic;">Start writing…</p>');
+}
+
+window.setBgColor = function(color) {
+    _bgColor = color || '';
+    renderPreview(_content);
+};
+
+function loadContent(html, _unused) {
+    _content = html || '';
+    editor.value = _content;
+    renderPreview(_content);
+    if (_editMode) editor.focus();
+}
+
+function setEditMode(enabled) {
+    _editMode = Boolean(enabled);
+    document.body.classList.toggle('edit-mode', _editMode);
+    if (_editMode) setTimeout(() => editor.focus(), 0);
+}
+
+function setPreviewHtml(html) {
+    _content = html || '';
+    editor.value = _content;
+    renderPreview(_content);
+}
+
+document.getElementById('preview-overlay').addEventListener('click', () => {
+    setEditMode(true);
+    if (window.Bridge) Bridge.requestFocus();
+});
+
+editor.addEventListener('input', () => {
+    _content = editor.value;
+    renderPreview(_content);
+    if (window.Bridge) Bridge.contentChanged(_content);
+});
+
+new QWebChannel(qt.webChannelTransport, channel => {
+    window.Bridge = channel.objects.bridge;
+    Bridge.ready();
+});
+</script>
+</body>
+</html>

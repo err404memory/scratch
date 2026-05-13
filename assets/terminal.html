@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self' qrc:; script-src 'self' qrc:; style-src 'self' 'unsafe-inline';">
+<link rel="stylesheet" href="xterm.css">
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="xterm.js"></script>
+<script src="xterm-addon-fit.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: #0d1117; display: flex; flex-direction: column; }
+
+#term-bar {
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    padding: 2px 8px;
+    font-size: 10px;
+    color: #484f58;
+    font-family: monospace;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    min-height: 22px;
+}
+#term-bar button {
+    background: transparent; border: none; color: #8b949e;
+    cursor: pointer; font-size: 11px; padding: 1px 5px; border-radius: 3px;
+    margin-left: auto;
+}
+#term-bar button:hover { background: #2d2d4e; color: #e6edf3; }
+#terminal-wrapper { flex: 1; min-height: 0; padding: 3px; }
+</style>
+</head>
+<body>
+<div id="term-bar">
+  <span id="cwd">~</span>
+  <button id="close-btn">✕</button>
+</div>
+<div id="terminal-wrapper"></div>
+
+<script>
+"use strict";
+
+const term = new Terminal({
+    theme: {
+        background: '#0d1117', foreground: '#e6edf3', cursor: '#58a6ff',
+        selectionBackground: '#264f78',
+        black: '#0d1117',    brightBlack: '#484f58',
+        red: '#ff7b72',      brightRed: '#ffa198',
+        green: '#3fb950',    brightGreen: '#56d364',
+        yellow: '#d29922',   brightYellow: '#e3b341',
+        blue: '#58a6ff',     brightBlue: '#79c0ff',
+        magenta: '#bc8cff',  brightMagenta: '#d2a8ff',
+        cyan: '#39c5cf',     brightCyan: '#56d4dd',
+        white: '#b1bac4',    brightWhite: '#f0f6fc',
+    },
+    fontFamily: 'monospace',
+    fontSize: 12,
+    cursorBlink: true,
+    scrollback: 2000,
+});
+
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal-wrapper'));
+
+term.onData(data => { if (window.Bridge) Bridge.terminalInput(data); });
+
+window.addEventListener('resize', () => {
+    fitAddon.fit();
+    if (window.Bridge) Bridge.terminalResize(term.cols, term.rows);
+});
+
+function doFit() {
+    fitAddon.fit();
+    if (window.Bridge) Bridge.terminalReady(term.cols, term.rows);
+}
+
+new QWebChannel(qt.webChannelTransport, channel => {
+    window.Bridge = channel.objects.bridge;
+
+    Bridge.terminalOutputSignal.connect(data => term.write(data));
+    Bridge.cwdSignal.connect(cwd => {
+        document.getElementById('cwd').textContent = cwd;
+    });
+    Bridge.fitSignal.connect(doFit);
+
+    document.getElementById('close-btn').addEventListener('click', () => {
+        Bridge.closeTerminal();
+    });
+
+    // Give the layout a moment to settle before first fit
+    setTimeout(doFit, 80);
+    Bridge.ready();
+});
+</script>
+</body>
+</html>
