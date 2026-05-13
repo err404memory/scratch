@@ -1,0 +1,13 @@
+# local notes / chat exports
+ash.md
+*.txt
+
+# local tool state
+.agents/
+.claude/
+.codex/
+
+# Python cache and test/runtime artifacts
+__pycache__/
+.pytest_cache/
+*.pyc
