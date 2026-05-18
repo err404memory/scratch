@@ -20,14 +20,14 @@ import urllib.parse
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QObject, QPoint, QSize, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QCursor, QIcon, QKeySequence, QShortcut
+from PyQt6.QtGui import QCursor, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
-    QApplication, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMenu, QMessageBox, QPushButton, QSplitter, QSystemTrayIcon, QTabWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMenu, QMessageBox, QPushButton, QSizePolicy, QSpacerItem, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
     QTextEdit, QVBoxLayout, QWidget, QInputDialog,
 )
 
@@ -40,7 +40,6 @@ from scratch_core import (
     livecodes_url,
     ollama_generate_payload,
     ollama_stream_chunks,
-    page_title_from_html,
     plain_text_from_html,
     preformatted_html,
     resize_rect,
@@ -57,36 +56,116 @@ LIVECODES_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "livecodes_pane.html"))
 TERMINAL_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "terminal.html"))
 SOCKET_PATH  = f"/tmp/scratch-{os.getuid()}.sock"
 
-STYLE = """
-QWidget#root { background: #1a1a2e; border: 1px solid #2d2d4e; border-radius: 8px; }
-QFrame#topbar, QFrame#navbar { background: #16213e; }
-QFrame#topbar { border-top-left-radius: 8px; border-top-right-radius: 8px; }
-QFrame#navbar { border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; }
-QSplitter::handle { background: #2d2d4e; }
-QSplitter::handle:horizontal { width: 3px; }
-QSplitter::handle:vertical   { height: 4px; }
-QPushButton {
-    background: transparent; color: #8b8bac; border: none;
-    font-size: 14px; padding: 2px 4px; border-radius: 5px;
+DEFAULT_UI_SETTINGS = {
+    "window_color": "#1a1a2e",
+    "title_bar_color": "#16213e",
+    "page_rail_color": "#16213e",
+    "border_color": "#2d2d4e",
+    "button_color": "#c5d0e0",
+    "button_hover": "#263451",
+    "button_border": "#3b4764",
+    "pin_glow_color": "#42d9ff",
+    "border_radius": 8,
+    "button_radius": 5,
+    "toolbar_padding": 6,
+    "toolbar_button_spacing": 3,
+    "toolbar_group_spacing": 10,
+    "page_rail_padding": 6,
+    "button_size": 27,
+    "button_height": 25,
+    "start_pinned": True,
+    "ctrl_wheel_pages": True,
+    "hide_on_close": True,
 }
-QPushButton:hover { background: #2d2d4e; color: #e6edf3; }
-QPushButton#command {
-    background: rgba(255,255,255,.04); color: #c5d0e0;
-    border: 1px solid rgba(139,139,172,.16); font-size: 16px; font-weight: 600;
-}
-QPushButton#command:hover { background: #263451; color: #ffffff; }
-QPushButton#mode-on { background: #7ec8a4; color: #0f1720; font-weight: 700; }
-QPushButton#tool-on { background: #7cc4ff; color: #0f1720; font-weight: 700; }
-QPushButton#pin-on  { color: #ffd700; }
-QPushButton#pin-off { color: #4a4a6a; }
-QPushButton#danger  { color: #ff8f9a; }
-QPushButton#add     { color: #7ec8a4; font-size: 17px; font-weight: bold; }
-QPushButton#del     { color: #e06c75; }
-QPushButton#nav     { color: #9aacd0; font-size: 14px; }
-QPushButton#nav:hover    { color: #e6edf3; }
-QPushButton#nav:disabled { color: #2d2d4e; }
-QLabel#page-label { color: #9aacd0; font-size: 11px; font-weight: 700; }
-QLabel#page-title { color: #7f8ead; font-size: 10px; font-style: italic; }
+
+
+def _hex_color(value, fallback):
+    value = str(value or "").strip()
+    if len(value) == 7 and value[0] == "#" and all(c in "0123456789abcdefABCDEF" for c in value[1:]):
+        return value.lower()
+    return fallback
+
+
+def _bounded_int(value, fallback, minimum, maximum):
+    try:
+        return max(minimum, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def normalized_ui_settings(raw):
+    ui = DEFAULT_UI_SETTINGS.copy()
+    if isinstance(raw, dict):
+        ui.update(raw)
+    for key in (
+        "window_color",
+        "title_bar_color",
+        "page_rail_color",
+        "border_color",
+        "button_color",
+        "button_hover",
+        "button_border",
+        "pin_glow_color",
+    ):
+        ui[key] = _hex_color(ui.get(key), DEFAULT_UI_SETTINGS[key])
+    ui["border_radius"] = _bounded_int(ui.get("border_radius"), 8, 0, 24)
+    ui["button_radius"] = _bounded_int(ui.get("button_radius"), 5, 0, 14)
+    ui["toolbar_padding"] = _bounded_int(ui.get("toolbar_padding"), 6, 0, 18)
+    ui["toolbar_button_spacing"] = _bounded_int(ui.get("toolbar_button_spacing"), 3, 0, 12)
+    ui["toolbar_group_spacing"] = _bounded_int(ui.get("toolbar_group_spacing"), 10, 0, 24)
+    ui["page_rail_padding"] = _bounded_int(ui.get("page_rail_padding"), 6, 0, 18)
+    ui["button_size"] = _bounded_int(ui.get("button_size"), 27, 24, 34)
+    ui["button_height"] = _bounded_int(ui.get("button_height"), 25, 22, 32)
+    ui["start_pinned"] = bool(ui.get("start_pinned"))
+    ui["ctrl_wheel_pages"] = bool(ui.get("ctrl_wheel_pages"))
+    ui["hide_on_close"] = bool(ui.get("hide_on_close"))
+    return ui
+
+
+def _hex_to_rgb(value):
+    value = _hex_color(value, DEFAULT_UI_SETTINGS["pin_glow_color"])
+    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def style_from_ui(raw):
+    ui = normalized_ui_settings(raw)
+    glow_r, glow_g, glow_b = _hex_to_rgb(ui["pin_glow_color"])
+    radius = ui["border_radius"]
+    button_radius = ui["button_radius"]
+    return f"""
+QWidget#root {{ background: {ui["window_color"]}; border: 1px solid {ui["border_color"]}; border-radius: {radius}px; }}
+QFrame#topbar {{ background: {ui["title_bar_color"]}; border-top-left-radius: {radius}px; border-top-right-radius: {radius}px; }}
+QFrame#navbar {{ background: {ui["page_rail_color"]}; border-bottom-left-radius: {radius}px; border-bottom-right-radius: {radius}px; }}
+QSplitter::handle {{ background: {ui["border_color"]}; }}
+QSplitter::handle:horizontal {{ width: 3px; }}
+QSplitter::handle:vertical   {{ height: 4px; }}
+QPushButton {{
+    background: rgba(255,255,255,.04); color: {ui["button_color"]};
+    border: 1px solid {ui["button_border"]}; font-size: 16px;
+    font-weight: 650; padding: 0; border-radius: {button_radius}px;
+}}
+QPushButton:hover {{ background: {ui["button_hover"]}; color: #ffffff; }}
+QPushButton#command {{ background: rgba(255,255,255,.04); color: {ui["button_color"]}; }}
+QPushButton#mode-on {{ background: #7ec8a4; color: #0f1720; font-weight: 700; }}
+QPushButton#tool-on {{ background: #7cc4ff; color: #0f1720; font-weight: 700; }}
+QPushButton#pin-on  {{
+    color: #dffcff;
+    background: qradialgradient(cx:.5, cy:.52, radius:.42,
+        stop:0 rgba({glow_r},{glow_g},{glow_b},150), stop:.46 rgba({glow_r},{glow_g},{glow_b},56), stop:1 rgba({glow_r},{glow_g},{glow_b},0));
+}}
+QPushButton#pin-on:hover {{
+    color: #ffffff;
+    background: qradialgradient(cx:.5, cy:.52, radius:.45,
+        stop:0 rgba({glow_r},{glow_g},{glow_b},190), stop:.48 rgba({glow_r},{glow_g},{glow_b},70), stop:1 rgba({glow_r},{glow_g},{glow_b},0));
+}}
+QPushButton#pin-off {{ color: #6f7894; background: rgba(255,255,255,.04); }}
+QPushButton#danger  {{ color: #ff8f9a; }}
+QPushButton#add     {{ color: #7ec8a4; }}
+QPushButton#del     {{ color: #ff5f6d; }}
+QPushButton#nav     {{ color: #9aacd0; font-size: 14px; background: transparent; border: none; }}
+QPushButton#nav:hover    {{ background: {ui["button_hover"]}; color: #e6edf3; }}
+QPushButton#nav:disabled {{ color: #2d2d4e; background: transparent; }}
+QLabel#page-label {{ color: #9aacd0; font-size: 11px; font-weight: 700; }}
 """
 
 # ── single-instance ──────────────────────────────────────────────────────────
@@ -309,7 +388,6 @@ class QuillPane(QWidget):
         if self._pending_html is not None:
             self._send_content(self._pending_html)
             self._pending_html = None
-        self._pad._apply_bg_color(self)
 
     def on_content_changed(self, content):
         try:
@@ -602,7 +680,115 @@ class ConfigDialog(QDialog):
                 "system": self.ollama_system.toPlainText(),
             },
             "share_targets": share_targets,
+            "ui": self._config.get("ui", normalized_ui_settings({})),
         }
+
+
+class UiSettingsDialog(QDialog):
+    """Context-menu panel for window appearance and low-friction behaviors."""
+
+    def __init__(self, parent, ui_config):
+        super().__init__(parent)
+        self.setWindowTitle("Scratch window UI")
+        self.resize(460, 440)
+        ui = normalized_ui_settings(ui_config)
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        root.addLayout(form, 1)
+
+        def color_row(label, key):
+            field = QLineEdit(ui[key])
+            field.setPlaceholderText("#16213e")
+            form.addRow(label, field)
+            return field
+
+        def int_row(label, key, minimum, maximum):
+            field = QSpinBox(self)
+            field.setRange(minimum, maximum)
+            field.setValue(ui[key])
+            form.addRow(label, field)
+            return field
+
+        self.window_color = color_row("Window background", "window_color")
+        self.title_bar_color = color_row("Title bar color", "title_bar_color")
+        self.page_rail_color = color_row("Page rail color", "page_rail_color")
+        self.border_color = color_row("Border color", "border_color")
+        self.button_color = color_row("Button icon color", "button_color")
+        self.button_hover = color_row("Button hover color", "button_hover")
+        self.button_border = color_row("Button border color", "button_border")
+        self.pin_glow_color = color_row("Pin glow color", "pin_glow_color")
+
+        self.border_radius = int_row("Window radius", "border_radius", 0, 24)
+        self.button_radius = int_row("Button radius", "button_radius", 0, 14)
+        self.toolbar_padding = int_row("Toolbar side padding", "toolbar_padding", 0, 18)
+        self.toolbar_button_spacing = int_row("Button spacing", "toolbar_button_spacing", 0, 12)
+        self.toolbar_group_spacing = int_row("Group spacing", "toolbar_group_spacing", 0, 24)
+        self.page_rail_padding = int_row("Page rail side padding", "page_rail_padding", 0, 18)
+        self.button_size = int_row("Button width", "button_size", 24, 34)
+        self.button_height = int_row("Button height", "button_height", 22, 32)
+
+        self.start_pinned = QCheckBox("Start pinned / always on top")
+        self.start_pinned.setChecked(ui["start_pinned"])
+        self.ctrl_wheel_pages = QCheckBox("Ctrl + mouse wheel changes pages")
+        self.ctrl_wheel_pages.setChecked(ui["ctrl_wheel_pages"])
+        self.hide_on_close = QCheckBox("Close hides to tray instead of quitting")
+        self.hide_on_close.setChecked(ui["hide_on_close"])
+        form.addRow("Startup", self.start_pinned)
+        form.addRow("Navigation", self.ctrl_wheel_pages)
+        form.addRow("Close behavior", self.hide_on_close)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.RestoreDefaults |
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(self._restore_defaults)
+        root.addWidget(buttons)
+
+    def _restore_defaults(self):
+        defaults = normalized_ui_settings({})
+        for key, widget in self._fields().items():
+            if isinstance(widget, QLineEdit):
+                widget.setText(defaults[key])
+            elif isinstance(widget, QSpinBox):
+                widget.setValue(defaults[key])
+        self.start_pinned.setChecked(defaults["start_pinned"])
+        self.ctrl_wheel_pages.setChecked(defaults["ctrl_wheel_pages"])
+        self.hide_on_close.setChecked(defaults["hide_on_close"])
+
+    def _fields(self):
+        return {
+            "window_color": self.window_color,
+            "title_bar_color": self.title_bar_color,
+            "page_rail_color": self.page_rail_color,
+            "border_color": self.border_color,
+            "button_color": self.button_color,
+            "button_hover": self.button_hover,
+            "button_border": self.button_border,
+            "pin_glow_color": self.pin_glow_color,
+            "border_radius": self.border_radius,
+            "button_radius": self.button_radius,
+            "toolbar_padding": self.toolbar_padding,
+            "toolbar_button_spacing": self.toolbar_button_spacing,
+            "toolbar_group_spacing": self.toolbar_group_spacing,
+            "page_rail_padding": self.page_rail_padding,
+            "button_size": self.button_size,
+            "button_height": self.button_height,
+        }
+
+    def value(self):
+        values = {}
+        for key, widget in self._fields().items():
+            if isinstance(widget, QLineEdit):
+                values[key] = widget.text().strip()
+            elif isinstance(widget, QSpinBox):
+                values[key] = widget.value()
+        values["start_pinned"] = self.start_pinned.isChecked()
+        values["ctrl_wheel_pages"] = self.ctrl_wheel_pages.isChecked()
+        values["hide_on_close"] = self.hide_on_close.isChecked()
+        return normalized_ui_settings(values)
 
 
 # ── main window ──────────────────────────────────────────────────────────────
@@ -616,8 +802,8 @@ class ScratchPad(QWidget):
         super().__init__()
         self.notes = self._load()
         self.config = self._load_config()
-        self._bg_color = self.notes.get("window", {}).get("bg_color", "")
-        self.pinned = True
+        self._ui_settings = normalized_ui_settings(self.config.get("ui", {}))
+        self.pinned = self._ui_settings["start_pinned"]
         self._panes: list[QuillPane] = []
         self._active_pane_index = 0
         self._shortcuts = []
@@ -700,6 +886,7 @@ class ScratchPad(QWidget):
                     "format": "html",
                 }
             ],
+            "ui": normalized_ui_settings({}),
         }
 
     def _load_config(self):
@@ -736,7 +923,6 @@ class ScratchPad(QWidget):
             "height": current_geometry[3],
             "h_split_sizes": self.h_split.sizes(),
             "term_height": self._term_height,
-            "bg_color": self._bg_color,
             "active_page": self._active_pane().page_index,
         }
         DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -749,13 +935,10 @@ class ScratchPad(QWidget):
         ws = self.notes.get("window", {})
         self.setWindowTitle("Scratch")
         self.setObjectName("root")
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool)
+        self.setWindowFlags(self._window_flags_for_pin(self.pinned))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumSize(420, 260)
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(style_from_ui(self._ui_settings))
 
         w = ws.get("width", 440)
         h = ws.get("height", 460)
@@ -777,6 +960,12 @@ class ScratchPad(QWidget):
         # cannot expand the window past the intended size.
         self._init_geometry = (x, y, w, h)
 
+    def _window_flags_for_pin(self, pinned):
+        flags = Qt.WindowType.FramelessWindowHint
+        if pinned:
+            flags |= Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
+        return flags
+
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -786,17 +975,23 @@ class ScratchPad(QWidget):
 
         topbar = DragHandle(self)
         topbar.setObjectName("topbar")
-        topbar.setFixedHeight(38)
+        topbar.setFixedHeight(max(36, self._ui_settings["button_height"] + 12))
+        self._topbar = topbar
         top = QHBoxLayout(topbar)
-        top.setContentsMargins(6, 0, 6, 0)
-        top.setSpacing(4)
+        top.setContentsMargins(self._ui_settings["toolbar_padding"], 0, self._ui_settings["toolbar_padding"], 0)
+        top.setSpacing(self._ui_settings["toolbar_button_spacing"])
+        self._top_layout = top
+        self._toolbar_group_spacers = []
 
-        def btn(label, size=28, obj_name="command", tip=None):
+        def btn(label, obj_name="command", tip=None):
             b = QPushButton(label)
-            b.setFixedSize(QSize(size, 26))
+            b.setFixedSize(QSize(self._ui_settings["button_size"], self._ui_settings["button_height"]))
             if obj_name: b.setObjectName(obj_name)
             if tip:      b.setToolTip(tip)
+            self._toolbar_buttons.append(b)
             return b
+
+        self._toolbar_buttons = []
 
         self.pin_btn = btn("📌", obj_name="pin-on", tip="Pin window  (Ctrl+P, double-click top bar)")
         self.pin_btn.clicked.connect(self._toggle_pin)
@@ -805,40 +1000,38 @@ class ScratchPad(QWidget):
         self.page_label.setObjectName("page-label")
         self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.edit_btn = btn("✎", tip="Edit note  (Ctrl+E)")
         self.add_btn = btn("+", obj_name="add", tip="New page  (Ctrl+N)")
+        self.del_btn = btn("🗑", obj_name="del", tip="Delete current page  (Ctrl+W)")
         self.ask_btn = btn("🤖", tip="Ask Ollama  (Ctrl+Shift+A)")
         self.term_btn = btn("⌨", tip="Toggle terminal  (Ctrl+T)")
         self.split_btn = btn("◫", tip="Split pane  (Ctrl+\\); close splits with Ctrl+Shift+\\")
-        self.share_btn = btn("⇪", tip="Share selection or note  (Ctrl+Shift+S)")
-        self.color_btn = btn("◐", tip="Background color  (Ctrl+B)")
-        self.export_btn = btn("⇩", tip="Export page  (Ctrl+S)")
-        self.config_btn = btn("⚙", tip="Configure sharing and Ollama  (Ctrl+,)")
         self.hide_btn = btn("–", tip="Hide to tray  (Ctrl+H)")
         self.quit_btn = btn("×", obj_name="danger", tip="Quit  (Ctrl+Q)")
 
-        self.edit_btn.clicked.connect(self._toggle_edit_mode)
         self.add_btn.clicked.connect(self._new_page)
+        self.del_btn.clicked.connect(self._delete_page)
         self.ask_btn.clicked.connect(self._ask_ollama)
         self.term_btn.clicked.connect(self._toggle_terminal)
         self.split_btn.clicked.connect(self._toggle_split_panes)
-        self.share_btn.clicked.connect(self._open_share_menu)
-        self.color_btn.clicked.connect(self._pick_bg_color)
-        self.export_btn.clicked.connect(self._export_page)
-        self.config_btn.clicked.connect(self._open_config_panel)
         self.hide_btn.clicked.connect(self.hide)
         self.quit_btn.clicked.connect(self._quit)
 
         def add_group(*widgets):
             if top.count():
-                top.addSpacing(8)
+                spacer = QSpacerItem(
+                    self._ui_settings["toolbar_group_spacing"],
+                    0,
+                    QSizePolicy.Policy.Fixed,
+                    QSizePolicy.Policy.Minimum,
+                )
+                self._toolbar_group_spacers.append(spacer)
+                top.addItem(spacer)
             for widget in widgets:
                 top.addWidget(widget)
 
         add_group(self.pin_btn)
-        add_group(self.edit_btn, self.add_btn)
+        add_group(self.add_btn, self.del_btn)
         add_group(self.ask_btn, self.term_btn, self.split_btn)
-        add_group(self.share_btn, self.color_btn, self.export_btn, self.config_btn)
         top.addStretch()
         add_group(self.hide_btn, self.quit_btn)
 
@@ -848,31 +1041,30 @@ class ScratchPad(QWidget):
         navbar = QFrame(self)
         navbar.setObjectName("navbar")
         navbar.setFixedHeight(34)
-        nav = QHBoxLayout(navbar)
-        nav.setContentsMargins(7, 0, 7, 0)
-        nav.setSpacing(4)
+        nav = QGridLayout(navbar)
+        nav.setContentsMargins(self._ui_settings["page_rail_padding"], 0, self._ui_settings["page_rail_padding"], 0)
+        nav.setHorizontalSpacing(4)
+        self._nav_layout = nav
+        nav.setColumnStretch(0, 1)
+        nav.setColumnStretch(1, 1)
+        nav.setColumnStretch(2, 1)
 
         self.prev_btn = btn("◀", obj_name="nav", tip="Previous page  (Ctrl+Left, Ctrl+wheel up)")
         self.prev_btn.clicked.connect(self._prev_page)
 
-        self.page_title = QLabel("")
-        self.page_title.setObjectName("page-title")
-        self.page_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         self.next_btn = btn("▶", obj_name="nav", tip="Next page  (Ctrl+Right, Ctrl+wheel down)")
         self.next_btn.clicked.connect(self._next_page)
 
-        self.del_btn = btn("✕", obj_name="del", tip="Delete page  (Ctrl+W)")
-        self.del_btn.clicked.connect(self._delete_page)
+        right_nav = QWidget(self)
+        right_nav_layout = QHBoxLayout(right_nav)
+        right_nav_layout.setContentsMargins(0, 0, 0, 0)
+        right_nav_layout.setSpacing(4)
+        right_nav_layout.addStretch()
+        right_nav_layout.addWidget(self.next_btn)
 
-        grip = ResizeGrip(self)
-
-        nav.addWidget(self.prev_btn)
-        nav.addWidget(self.page_label)
-        nav.addWidget(self.page_title, 1)
-        nav.addWidget(self.next_btn)
-        nav.addWidget(self.del_btn)
-        nav.addWidget(grip)
+        nav.addWidget(self.prev_btn, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        nav.addWidget(self.page_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        nav.addWidget(right_nav, 0, 2)
 
         root.addWidget(topbar)
         root.addWidget(self.h_split, 1)
@@ -997,7 +1189,6 @@ class ScratchPad(QWidget):
         self.page_label.setText(f"{idx + 1} / {total}")
         self.prev_btn.setEnabled(idx > 0)
         self.next_btn.setEnabled(idx < total - 1)
-        self.page_title.setText(page_title_from_html(self.notes["pages"][idx]))
         self._sync_command_states()
 
     def _set_button_object_name(self, button, name):
@@ -1007,12 +1198,34 @@ class ScratchPad(QWidget):
         button.style().unpolish(button)
         button.style().polish(button)
 
-    def _sync_command_states(self):
-        if hasattr(self, "edit_btn"):
-            self._set_button_object_name(
-                self.edit_btn,
-                "mode-on" if self._active_pane()._edit_mode else "command",
+    def _apply_ui_settings(self):
+        self._ui_settings = normalized_ui_settings(self.config.get("ui", {}))
+        self.setStyleSheet(style_from_ui(self._ui_settings))
+        if hasattr(self, "_topbar"):
+            self._topbar.setFixedHeight(max(36, self._ui_settings["button_height"] + 12))
+        if hasattr(self, "_top_layout"):
+            pad = self._ui_settings["toolbar_padding"]
+            self._top_layout.setContentsMargins(pad, 0, pad, 0)
+            self._top_layout.setSpacing(self._ui_settings["toolbar_button_spacing"])
+        for spacer in getattr(self, "_toolbar_group_spacers", []):
+            spacer.changeSize(
+                self._ui_settings["toolbar_group_spacing"],
+                0,
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Minimum,
             )
+        if hasattr(self, "_nav_layout"):
+            pad = self._ui_settings["page_rail_padding"]
+            self._nav_layout.setContentsMargins(pad, 0, pad, 0)
+        if hasattr(self, "_top_layout"):
+            self._top_layout.invalidate()
+        for button in getattr(self, "_toolbar_buttons", []):
+            button.setFixedSize(QSize(self._ui_settings["button_size"], self._ui_settings["button_height"]))
+            button.style().unpolish(button)
+            button.style().polish(button)
+        self.updateGeometry()
+
+    def _sync_command_states(self):
         if hasattr(self, "term_btn"):
             self._set_button_object_name(
                 self.term_btn,
@@ -1128,22 +1341,17 @@ class ScratchPad(QWidget):
         self._sync_command_states()
 
     def _toggle_pin(self):
-        self.pinned = not self.pinned
-        if self.pinned:
-            self.setWindowFlags(
-                Qt.WindowType.FramelessWindowHint |
-                Qt.WindowType.WindowStaysOnTopHint |
-                Qt.WindowType.Tool)
-            self.pin_btn.setObjectName("pin-on")
-        else:
-            # Drop Tool too — on KDE, Tool windows stay above others even
-            # without WindowStaysOnTopHint.
-            self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-            self.pin_btn.setObjectName("pin-off")
+        self._set_pin_state(not self.pinned)
+
+    def _set_pin_state(self, pinned):
+        self.pinned = bool(pinned)
+        self.setWindowFlags(self._window_flags_for_pin(self.pinned))
+        self.pin_btn.setObjectName("pin-on" if self.pinned else "pin-off")
         self.pin_btn.style().unpolish(self.pin_btn)
         self.pin_btn.style().polish(self.pin_btn)
         self.show()
-        self.raise_()
+        if self.pinned:
+            self.raise_()
 
     def _ask_ollama(self):
         prompt, ok = QInputDialog.getText(self, "Ask Ollama", "Prompt:")
@@ -1228,27 +1436,19 @@ class ScratchPad(QWidget):
                 action.setShortcut(QKeySequence(shortcut))
             return action
 
-        edit_act = add_action("Edit preview", "Ctrl+E")
-        new_act = add_action("New page", "Ctrl+N")
-        prev_act = add_action("Previous page", "Ctrl+Left")
-        next_act = add_action("Next page", "Ctrl+Right")
-        delete_act = add_action("Delete page", "Ctrl+W")
+        lc_editor_act = add_action("LiveCodes: show editor")
+        lc_result_act = add_action("LiveCodes: show result")
+        lc_toggle_result_act = add_action("LiveCodes: toggle result")
+        lc_run_act = add_action("LiveCodes: run project")
+        lc_format_act = add_action("LiveCodes: format code")
+        lc_cut_act = add_action("Cut")
+        lc_copy_act = add_action("Copy")
+        lc_paste_act = add_action("Paste")
+        lc_select_all_act = add_action("Select all")
         menu.addSeparator()
         ask_act = add_action("Ask Ollama", "Ctrl+Shift+A")
         term_act = add_action("Toggle terminal", "Ctrl+T")
         split_act = add_action("Split / unsplit", "Ctrl+\\")
-        menu.addSeparator()
-        livecodes_menu = menu.addMenu("LiveCodes")
-        lc_editor_act = livecodes_menu.addAction("Show editor")
-        lc_result_act = livecodes_menu.addAction("Show result")
-        lc_toggle_result_act = livecodes_menu.addAction("Toggle result")
-        lc_run_act = livecodes_menu.addAction("Run project")
-        lc_format_act = livecodes_menu.addAction("Format code")
-        livecodes_menu.addSeparator()
-        lc_cut_act = livecodes_menu.addAction("Cut")
-        lc_copy_act = livecodes_menu.addAction("Copy")
-        lc_paste_act = livecodes_menu.addAction("Paste")
-        lc_select_all_act = livecodes_menu.addAction("Select all")
         menu.addSeparator()
         share_menu = menu.addMenu("Share")
         share_copy_act = share_menu.addAction("Copy share text")
@@ -1272,28 +1472,25 @@ class ScratchPad(QWidget):
             )
         share_menu.addSeparator()
         share_menu.addAction("Configure sharing...").triggered.connect(self._open_config_panel)
-        config_act = add_action("Configure...", "Ctrl+,")
+        ui_settings_act = add_action("Window UI settings...")
+        config_act = add_action("Configure sharing/Ollama...")
         menu.addSeparator()
-        color_act = add_action("Background color...", "Ctrl+B")
-        export_act = add_action("Export page...", "Ctrl+S")
+        export_act = add_action("Export page...")
         pin_act = add_action("Toggle pin", "Ctrl+P")
         menu.addSeparator()
+        delete_act = add_action("Delete page", "Ctrl+W")
         hide_act = add_action("Hide to tray", "Ctrl+H")
         quit_act = add_action("Quit", "Ctrl+Q")
 
         return menu, {
-            edit_act: self._toggle_edit_mode,
-            new_act: self._new_page,
-            prev_act: self._prev_page,
-            next_act: self._next_page,
-            delete_act: self._delete_page,
             ask_act: self._ask_ollama,
             term_act: self._toggle_terminal,
             split_act: self._toggle_split_panes,
+            ui_settings_act: self._open_ui_settings_panel,
             config_act: self._open_config_panel,
-            color_act: self._pick_bg_color,
             export_act: self._export_page,
             pin_act: self._toggle_pin,
+            delete_act: self._delete_page,
             hide_act: self.hide,
             quit_act: self._quit,
             lc_editor_act: lambda: self._run_livecodes_action("show", ["editor"]),
@@ -1331,25 +1528,6 @@ class ScratchPad(QWidget):
         if pane and pane._editor_ready:
             pane.run_livecodes_edit_command(command)
 
-    def _apply_bg_color(self, pane):
-        if self._bg_color and pane._editor_ready:
-            pane.view.page().runJavaScript(
-                f"setBgColor({json.dumps(self._bg_color)})")
-
-    def _pick_bg_color(self):
-        initial = QColor(self._bg_color) if self._bg_color else QColor("#f8f6f1")
-        color = QColorDialog.getColor(initial, self, "Background color")
-        if color.isValid():
-            self._set_bg_color(color.name())
-
-    def _set_bg_color(self, hex_color):
-        self._bg_color = hex_color
-        for pane in self._panes:
-            if pane._editor_ready:
-                pane.view.page().runJavaScript(
-                    f"setBgColor({json.dumps(hex_color)})")
-        self.schedule_save()
-
     def _open_config_panel(self):
         dialog = ConfigDialog(self, self.config)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1362,60 +1540,15 @@ class ScratchPad(QWidget):
             return
         QMessageBox.information(self, "Scratch configuration", "Configuration saved.")
 
-    def _open_share_menu(self):
-        menu = self._build_share_menu()
-        anchor = getattr(self, "share_btn", self)
-        menu.exec(anchor.mapToGlobal(QPoint(0, anchor.height())))
-
-    def _build_share_menu(self):
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu { background:#16213e; color:#e6edf3; border:1px solid #2d2d4e; }"
-            "QMenu::item { padding:6px 24px; }"
-            "QMenu::item:selected { background:#2d2d4e; }"
-        )
-        copy_act = menu.addAction("Copy share text")
-        copy_act.setShortcut(QKeySequence("Ctrl+Shift+C"))
-        copy_act.triggered.connect(lambda: self._share_current("clipboard", {}))
-        ai_clipboard_act = menu.addAction("Copy for AI")
-        ai_clipboard_act.triggered.connect(lambda: self._share_current("ai_clipboard", {}))
-
-        telegram_menu = menu.addMenu("Telegram")
-        telegram = self.config.get("telegram", {})
-        default_chat = telegram.get("default_chat_id", "")
-        default_act = telegram_menu.addAction("Default chat" if default_chat else "Configure Telegram...")
-        default_act.triggered.connect(
-            (lambda: self._share_current("telegram", {"chat_id": default_chat}))
-            if default_chat
-            else self._open_config_panel
-        )
-        for chat in telegram.get("recent_chats", []):
-            label = chat.get("title") or chat.get("username") or str(chat.get("id", ""))
-            chat_id = str(chat.get("id", ""))
-            if not chat_id:
-                continue
-            action = telegram_menu.addAction(label)
-            action.triggered.connect(
-                lambda checked=False, cid=chat_id: self._share_current("telegram", {"chat_id": cid})
-            )
-        telegram_menu.addSeparator()
-        telegram_menu.addAction("Configure Telegram...").triggered.connect(self._open_config_panel)
-
-        targets = self.config.get("share_targets", [])
-        if targets:
-            menu.addSeparator()
-            for target in targets:
-                if not isinstance(target, dict):
-                    continue
-                name = target.get("name") or target.get("kind") or "Share target"
-                action = menu.addAction(str(name))
-                action.triggered.connect(
-                    lambda checked=False, t=target: self._share_current(str(t.get("kind", "")), t)
-                )
-
-        menu.addSeparator()
-        menu.addAction("Configure sharing...").triggered.connect(self._open_config_panel)
-        return menu
+    def _open_ui_settings_panel(self):
+        dialog = UiSettingsDialog(self, self.config.get("ui", {}))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.config["ui"] = dialog.value()
+        self._save_config()
+        self._apply_ui_settings()
+        self._set_pin_state(self._ui_settings["start_pinned"])
+        QMessageBox.information(self, "Scratch window UI", "Window UI settings saved.")
 
     def _share_current(self, kind, target):
         self._active_pane().get_share_payload(
@@ -1587,7 +1720,7 @@ class ScratchPad(QWidget):
         return QSize(w, h)
 
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        if self._ui_settings["ctrl_wheel_pages"] and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             if event.angleDelta().y() < 0:
                 self._next_page()
             elif event.angleDelta().y() > 0:
@@ -1617,10 +1750,13 @@ class ScratchPad(QWidget):
         super().resizeEvent(event)
 
     def closeEvent(self, event):
-        self._flush_save()
-        self.global_pty.stop()
-        event.ignore()
-        self.hide()
+        if self._ui_settings["hide_on_close"]:
+            self._flush_save()
+            self.global_pty.stop()
+            event.ignore()
+            self.hide()
+            return
+        self._quit()
 
     def show_and_raise(self):
         self.show()

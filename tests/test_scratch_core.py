@@ -166,16 +166,16 @@ def test_create_shortcuts_retains_each_binding():
 def test_shortcuts_cover_visible_command_strip_actions():
     bindings = dict(scratch_core.SHORTCUTS)
 
-    assert bindings["Ctrl+E"] == "_toggle_edit_mode"
     assert bindings["Ctrl+N"] == "_new_page"
     assert bindings["Ctrl+T"] == "_toggle_terminal"
     assert bindings["Ctrl+\\"] == "_split_pane"
     assert bindings["Ctrl+Shift+\\"] == "_close_extra_panes"
-    assert bindings["Ctrl+B"] == "_pick_bg_color"
-    assert bindings["Ctrl+S"] == "_export_page"
     assert bindings["Ctrl+P"] == "_toggle_pin"
-    assert bindings["Ctrl+Shift+S"] == "_open_share_menu"
-    assert bindings["Ctrl+,"] == "_open_config_panel"
+    assert "Ctrl+E" not in bindings
+    assert "Ctrl+B" not in bindings
+    assert "Ctrl+S" not in bindings
+    assert "Ctrl+Shift+S" not in bindings
+    assert "Ctrl+," not in bindings
 
 
 def test_hit_test_resize_edges_prefers_corners():
@@ -233,9 +233,23 @@ def test_livecodes_config_detects_html_markdown_and_css():
 
     assert html_cfg["markup"]["language"] == "html"
     assert md_cfg["markup"]["language"] == "markdown"
+    assert md_cfg["style"] == {"language": "css", "content": ""}
+    assert md_cfg["script"] == {"language": "javascript", "content": ""}
     assert css_cfg["markup"]["language"] == "html"
     assert css_cfg["style"]["language"] == "css"
     assert "scratch-css-preview" in css_cfg["markup"]["content"]
+
+
+def test_livecodes_config_clears_absent_tabs_between_notes():
+    css_cfg = scratch_core.livecodes_config_from_source("body { background: tomato; }")
+    markdown_cfg = scratch_core.livecodes_config_from_source("# Plain note")
+    html_cfg = scratch_core.livecodes_config_from_source("<h1>Plain HTML</h1>")
+
+    assert css_cfg["style"]["content"] == "body { background: tomato; }"
+    assert markdown_cfg["style"]["content"] == ""
+    assert markdown_cfg["script"]["content"] == ""
+    assert html_cfg["style"]["content"] == ""
+    assert html_cfg["script"]["content"] == ""
 
 
 def test_livecodes_config_splits_fenced_blocks():

@@ -88,6 +88,8 @@ def test_livecodes_pane_exposes_scratch_bridge_contract():
     assert "livecodes-ready" in livecodes_html
     assert "livecodes-change" in livecodes_html
     assert "scratch-open-context-menu" in livecodes_html
+    assert "function completeConfig(config)" in livecodes_html
+    assert "style: { language: style.language || 'css', content: style.content || '' }" in livecodes_html
     assert "callApi('setConfig'" in livecodes_html
     assert "window.callLiveCodesApi" in livecodes_html
     assert "window.callLiveCodesEditCommand" in livecodes_html
@@ -101,13 +103,16 @@ def test_livecodes_pane_exposes_scratch_bridge_contract():
 def test_scratch_ui_exposes_low_friction_commands():
     scratch_source = Path("scratch.py").read_text()
 
-    assert 'btn("✎"' in scratch_source
     assert 'btn("+"' in scratch_source
-    assert 'btn("⇪"' in scratch_source
-    assert 'btn("⚙"' in scratch_source
-    assert 'add_action("Edit preview", "Ctrl+E")' in scratch_source
-    assert 'add_action("Background color...", "Ctrl+B")' in scratch_source
-    assert "def _open_share_menu(self):" in scratch_source
+    assert 'btn("🗑"' in scratch_source
+    assert 'btn("⇪"' not in scratch_source
+    assert 'btn("⚙"' not in scratch_source
+    assert 'btn("✎"' not in scratch_source
+    assert 'add_action("Edit preview", "Ctrl+E")' not in scratch_source
+    assert 'add_action("Background color...", "Ctrl+B")' not in scratch_source
+    assert "QGridLayout(navbar)" in scratch_source
+    assert "Qt.AlignmentFlag.AlignCenter" in scratch_source
+    assert "right_nav_layout.addStretch()" in scratch_source
     assert "class ConfigDialog(QDialog):" in scratch_source
     assert '"Copy for AI"' in scratch_source
     assert '"telegram":' in scratch_source
@@ -130,11 +135,21 @@ def test_scratch_ui_exposes_low_friction_commands():
     assert "scratch-edit-command" in scratch_source
     assert "def _build_context_menu(self):" in scratch_source
     assert "LiveCodes" in scratch_source
+    assert 'menu.addMenu("LiveCodes")' not in scratch_source
+    assert "LiveCodes: show editor" in scratch_source
     assert "Select all" in scratch_source
     assert "def _run_livecodes_action(self, method, args=None):" in scratch_source
     assert "def _run_livecodes_edit_action(self, command):" in scratch_source
     assert "font-size: 16px" in scratch_source
-    assert "QSize(size, 26)" in scratch_source
+    assert "DEFAULT_UI_SETTINGS" in scratch_source
+    assert "class UiSettingsDialog(QDialog):" in scratch_source
+    assert "Window UI settings..." in scratch_source
+    assert "pin_glow_color" in scratch_source
+    assert "toolbar_group_spacing" in scratch_source
+    assert "page_rail_padding" in scratch_source
+    assert 'rgba({glow_r},{glow_g},{glow_b}' in scratch_source
+    assert 'QSize(self._ui_settings["button_size"], self._ui_settings["button_height"])' in scratch_source
+    assert "qradialgradient" in scratch_source
 
 @pytest.fixture(scope="session")
 def qt_app():

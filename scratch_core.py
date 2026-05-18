@@ -25,14 +25,9 @@ SHORTCUTS: list[tuple[str, str]] = [
     ("Ctrl+Right", "_next_page"),
     ("Ctrl+W", "_delete_page"),
     ("Ctrl+T", "_toggle_terminal"),
-    ("Ctrl+E", "_toggle_edit_mode"),
     ("Ctrl+\\", "_split_pane"),
     ("Ctrl+Shift+\\", "_close_extra_panes"),
-    ("Ctrl+S", "_export_page"),
-    ("Ctrl+B", "_pick_bg_color"),
     ("Ctrl+P", "_toggle_pin"),
-    ("Ctrl+Shift+S", "_open_share_menu"),
-    ("Ctrl+,", "_open_config_panel"),
     ("Ctrl+Shift+A", "_ask_ollama"),
     ("Ctrl+H", "hide"),
     ("Ctrl+Q", "_quit"),
@@ -353,6 +348,27 @@ def looks_like_css(source: str) -> bool:
     return bool(re.search(r"[.#]?[A-Za-z0-9_:-]+\s*\{[^{}]+:[^{}]+;?\s*\}", text, re.DOTALL))
 
 
+def _complete_livecodes_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Include empty panels so LiveCodes clears stale tab content on page switch."""
+    complete = dict(config)
+    markup = complete.get("markup") if isinstance(complete.get("markup"), dict) else {}
+    style = complete.get("style") if isinstance(complete.get("style"), dict) else {}
+    script = complete.get("script") if isinstance(complete.get("script"), dict) else {}
+    complete["markup"] = {
+        "language": markup.get("language", "markdown"),
+        "content": markup.get("content", ""),
+    }
+    complete["style"] = {
+        "language": style.get("language", "css"),
+        "content": style.get("content", ""),
+    }
+    complete["script"] = {
+        "language": script.get("language", "javascript"),
+        "content": script.get("content", ""),
+    }
+    return complete
+
+
 def livecodes_config_from_source(source: str) -> dict[str, Any]:
     """Build a LiveCodes config from a single Scratch note string."""
     source = source or ""
@@ -378,17 +394,17 @@ def livecodes_config_from_source(source: str) -> dict[str, Any]:
             config["markup"] = {"language": "markdown", "content": "\n\n".join(markup_parts)}
         if "style" in config and config["markup"].get("language") == "markdown" and not config["markup"].get("content"):
             config["markup"] = {"language": "html", "content": CSS_PREVIEW_MARKUP}
-        return config
+        return _complete_livecodes_config(config)
 
     stripped = source.lstrip()
     if stripped.startswith("<") or re.search(r"<[A-Za-z][^>]*>", source):
-        return default_livecodes_config("html", source)
+        return _complete_livecodes_config(default_livecodes_config("html", source))
     if looks_like_css(source):
-        return {
+        return _complete_livecodes_config({
             "markup": {"language": "html", "content": CSS_PREVIEW_MARKUP},
             "style": {"language": "css", "content": source},
-        }
-    return default_livecodes_config("markdown", source)
+        })
+    return _complete_livecodes_config(default_livecodes_config("markdown", source))
 
 
 def livecodes_source_from_config(config: dict[str, Any]) -> str:

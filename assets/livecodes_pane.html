@@ -77,8 +77,21 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         postToLiveCodes({ method, id: String(++_apiId), args: args || [] });
     }
 
+    function completeConfig(config) {
+        const cfg = config || {};
+        const markup = cfg.markup || {};
+        const style = cfg.style || {};
+        const script = cfg.script || {};
+        return {
+            ...cfg,
+            markup: { language: markup.language || 'markdown', content: markup.content || '' },
+            style: { language: style.language || 'css', content: style.content || '' },
+            script: { language: script.language || 'javascript', content: script.content || '' },
+        };
+    }
+
     function applyConfig(config) {
-        _config = { mode: 'lite', view: _editMode ? 'editor' : 'result', ...(config || {}) };
+        _config = completeConfig({ mode: 'lite', view: _editMode ? 'editor' : 'result', ...(config || {}) });
         _sourceText = sourceFromConfig(_config);
         if (_ready) {
             callApi('setConfig', [_config]);
