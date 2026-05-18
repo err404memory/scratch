@@ -326,6 +326,100 @@ def default_livecodes_config(language: str = "markdown", content: str = "") -> d
     }
 
 
+CSS_PREVIEW_MARKUP = (
+    '<main class="scratch-css-preview">'
+    "<h1>Scratch CSS Preview</h1>"
+    "<p>This placeholder lets standalone CSS notes render visibly.</p>"
+    "</main>"
+)
+
+
+def _fenced_blocks(source: str) -> list[tuple[str, str]]:
+    pattern = re.compile(
+        r"^\s*(```|~~~)\s*([A-Za-z0-9_-]+)?\s*\n(.*?)^\s*\1\s*$",
+        re.MULTILINE | re.DOTALL,
+    )
+    return [
+        ((match.group(2) or "").lower(), match.group(3).strip("\n"))
+        for match in pattern.finditer(source or "")
+    ]
+
+
+def looks_like_css(source: str) -> bool:
+    """Heuristic for CSS-only scratch notes."""
+    text = source.strip()
+    if not text or "<" in text:
+        return False
+    return bool(re.search(r"[.#]?[A-Za-z0-9_:-]+\s*\{[^{}]+:[^{}]+;?\s*\}", text, re.DOTALL))
+
+
+def livecodes_config_from_source(source: str) -> dict[str, Any]:
+    """Build a LiveCodes config from a single Scratch note string."""
+    source = source or ""
+    blocks = _fenced_blocks(source)
+    if blocks:
+        config: dict[str, Any] = {"markup": {"language": "markdown", "content": ""}}
+        markup_parts: list[str] = []
+        for language, content in blocks:
+            if language in {"html", "xml", "svg"}:
+                config["markup"] = {"language": "html", "content": content}
+            elif language in {"md", "markdown"}:
+                markup_parts.append(content)
+            elif language in {"css", "scss", "sass"}:
+                config["style"] = {"language": "css", "content": content}
+            elif language in {"js", "javascript", "ts", "typescript"}:
+                config["script"] = {
+                    "language": "javascript" if language in {"js", "javascript"} else "typescript",
+                    "content": content,
+                }
+            else:
+                markup_parts.append(f"```{language}\n{content}\n```")
+        if markup_parts and not config["markup"].get("content"):
+            config["markup"] = {"language": "markdown", "content": "\n\n".join(markup_parts)}
+        if "style" in config and config["markup"].get("language") == "markdown" and not config["markup"].get("content"):
+            config["markup"] = {"language": "html", "content": CSS_PREVIEW_MARKUP}
+        return config
+
+    stripped = source.lstrip()
+    if stripped.startswith("<") or re.search(r"<[A-Za-z][^>]*>", source):
+        return default_livecodes_config("html", source)
+    if looks_like_css(source):
+        return {
+            "markup": {"language": "html", "content": CSS_PREVIEW_MARKUP},
+            "style": {"language": "css", "content": source},
+        }
+    return default_livecodes_config("markdown", source)
+
+
+def livecodes_source_from_config(config: dict[str, Any]) -> str:
+    """Collapse a LiveCodes config back into Scratch's single-note source format."""
+    markup = config.get("markup", {}) if isinstance(config, dict) else {}
+    style = config.get("style", {}) if isinstance(config, dict) else {}
+    script = config.get("script", {}) if isinstance(config, dict) else {}
+    parts: list[str] = []
+
+    markup_content = markup.get("content", "") if isinstance(markup, dict) else ""
+    markup_language = markup.get("language", "markdown") if isinstance(markup, dict) else "markdown"
+    has_style = bool(style.get("content", "")) if isinstance(style, dict) else False
+    has_script = bool(script.get("content", "")) if isinstance(script, dict) else False
+    if markup_content and markup_content != CSS_PREVIEW_MARKUP:
+        if markup_language == "markdown" or (markup_language == "html" and not has_style and not has_script):
+            parts.append(markup_content)
+        else:
+            parts.append(f"```{markup_language}\n{markup_content}\n```")
+
+    style_content = style.get("content", "") if isinstance(style, dict) else ""
+    if style_content:
+        parts.append(f"```css\n{style_content}\n```")
+
+    script_content = script.get("content", "") if isinstance(script, dict) else ""
+    script_language = script.get("language", "javascript") if isinstance(script, dict) else "javascript"
+    if script_content:
+        parts.append(f"```{script_language}\n{script_content}\n```")
+
+    return "\n\n".join(parts)
+
+
 def migrate_v1_to_v2(notes: dict[str, Any]) -> dict[str, Any]:
     """Migrate notes.json from v1 (list of HTML strings) to v2 (list of LiveCodes configs)."""
     pages = notes.get("pages", [""])
@@ -524,9 +618,15 @@ def start_livecodes_server(build_dir: Path = LIVECODES_BUILD_DIR, port: int = LI
     return thread, actual_port
 
 
-def livecodes_url(port: int = LIVECODES_PORT, path: str = "") -> str:
-    """Build a URL to the local LiveCodes development server."""
-    return f"http://localhost:{port}/{path}"
+def livecodes_url(port: int = LIVECODES_PORT, path: str = "", host: str = "127.0.0.2") -> str:
+    """
+    Build a URL to the local LiveCodes server.
+
+    LiveCodes treats localhost/127.0.0.1 as a development host and switches to a
+    separate sandbox server on 127.0.0.1:8085. Scratch only serves the static
+    LiveCodes build, so use a loopback alias to avoid that dev-only branch.
+    """
+    return f"http://{host}:{port}/{path}"
 
 
 # ── Ollama helpers ───────────────────────────────────────────────────────────

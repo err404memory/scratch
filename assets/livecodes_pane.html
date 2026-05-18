@@ -3,11 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
-<script src="http://localhost:4173/sdk/livecodes.umd.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; background: #0d1117; overflow: hidden; }
-#livecodes-container { width: 100%; height: 100%; }
+#livecodes-container, #livecodes-frame { width: 100%; height: 100%; border: 0; display: block; }
 #error-banner {
     display: none;
     position: absolute;
@@ -31,6 +30,8 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
 (function() {
     const container = document.getElementById('livecodes-container');
     const errorBanner = document.getElementById('error-banner');
+    const params = new URLSearchParams(window.location.search);
+    const appUrl = (params.get('appUrl') || 'http://localhost:4173/').replace(/\/?$/, '/');
 
     function showError(msg) {
         console.error(msg);
@@ -38,98 +39,152 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         errorBanner.style.display = 'block';
     }
 
-    if (typeof livecodes === 'undefined' || !livecodes.createPlayground) {
-        showError('LiveCodes SDK failed to load. Is the local server running?');
-        return;
+    let frame = null;
+    let _ready = false;
+    let _pendingConfig = null;
+    let _sourceText = '';
+    let _editMode = true;
+    let _config = { markup: { language: 'markdown', content: '' } };
+    let _apiId = 0;
+
+    function sourceFromConfig(config) {
+        const markup = config && config.markup ? config.markup : {};
+        const style = config && config.style ? config.style : {};
+        const script = config && config.script ? config.script : {};
+        const parts = [];
+        const hasStyle = Boolean(style.content);
+        const hasScript = Boolean(script.content);
+        if (markup.content && !String(markup.content).includes('scratch-css-preview')) {
+            parts.push(markup.language === 'markdown' || (markup.language === 'html' && !hasStyle && !hasScript)
+                ? markup.content
+                : `\`\`\`${markup.language || 'html'}\n${markup.content}\n\`\`\``);
+        }
+        if (style.content) parts.push(`\`\`\`css\n${style.content}\n\`\`\``);
+        if (script.content) parts.push(`\`\`\`${script.language || 'javascript'}\n${script.content}\n\`\`\``);
+        return parts.join('\n\n');
     }
 
-    let playground = null;
-    let _pendingConfig = null;
-    let _editMode = true;
-    let _suppressChange = false;
+    function appOrigin() {
+        return new URL(appUrl).origin;
+    }
 
-    function initPlayground(initialConfig) {
-        const config = {
-            mode: 'lite',
-            view: 'editor',
-            ...(initialConfig || {}),
-        };
+    function postToLiveCodes(message) {
+        if (!frame || !frame.contentWindow) return;
+        frame.contentWindow.postMessage(message, appOrigin());
+    }
 
-        livecodes.createPlayground(container, {
-            config: config,
-            appUrl: 'http://localhost:4173/',
-            loading: 'eager',
-        }).then(function(pg) {
-            playground = pg;
+    function callApi(method, args) {
+        postToLiveCodes({ method, id: String(++_apiId), args: args || [] });
+    }
 
-            playground.watch('code', function(_ref) {
-                if (_suppressChange || !window.Bridge) return;
-                var cfg = _ref.config;
-                Bridge.contentChanged(JSON.stringify(cfg));
-            });
+    function applyConfig(config) {
+        _config = { mode: 'lite', view: _editMode ? 'editor' : 'result', ...(config || {}) };
+        _sourceText = sourceFromConfig(_config);
+        if (_ready) {
+            callApi('setConfig', [_config]);
+            callApi('show', [_editMode ? 'editor' : 'result']);
+        } else {
+            _pendingConfig = JSON.stringify(_config);
+        }
+    }
 
-            if (_pendingConfig !== null) {
-                try {
-                    playground.setConfig(JSON.parse(_pendingConfig));
-                } catch (e) {
-                    console.error('Failed to load pending config:', e);
-                }
+    function initPlayground() {
+        frame = document.createElement('iframe');
+        frame.id = 'livecodes-frame';
+        frame.allow = 'accelerometer; camera; encrypted-media; display-capture; geolocation; gyroscope; microphone; midi; clipboard-read; clipboard-write; web-share';
+        frame.allowFullscreen = true;
+        const url = new URL(appUrl);
+        url.searchParams.set('embed', 'true');
+        url.searchParams.set('loading', 'eager');
+        url.searchParams.set('sdkVersion', '0.13.0');
+        frame.src = url.href;
+        container.replaceChildren(frame);
+    }
+
+    window.addEventListener('message', function(event) {
+        if (event.origin !== appOrigin()) return;
+        const data = event.data || {};
+        if (data.type === 'livecodes-get-config') {
+            postToLiveCodes({ type: 'livecodes-config', payload: _config });
+            return;
+        }
+        if (data.type === 'livecodes-ready') {
+            _ready = true;
+            if (_pendingConfig) {
+                applyConfig(JSON.parse(_pendingConfig));
                 _pendingConfig = null;
             }
-
-            if (!_editMode) {
-                playground.show('result');
-            }
-
-            if (window.Bridge) {
-                Bridge.ready();
-            }
-        }).catch(function(err) {
-            showError('LiveCodes failed to start: ' + (err && err.message ? err.message : String(err)));
-        });
-    }
+            callApi('show', [_editMode ? 'editor' : 'result']);
+            if (window.Bridge) Bridge.ready();
+            return;
+        }
+        if (data.type === 'livecodes-change') {
+            const cfg = data.payload && data.payload.config ? data.payload.config : data.payload;
+            if (!cfg) return;
+            _config = cfg;
+            _sourceText = sourceFromConfig(cfg);
+            if (window.Bridge) Bridge.contentChanged(JSON.stringify(cfg));
+            return;
+        }
+        if (data.type === 'scratch-open-context-menu') {
+            if (window.Bridge) Bridge.openContextMenu();
+        }
+    });
 
     window.loadConfig = function(configJson) {
-        if (playground) {
-            _suppressChange = true;
-            playground.setConfig(JSON.parse(configJson)).then(function() {
-                _suppressChange = false;
-            }).catch(function(e) {
-                _suppressChange = false;
-                console.error('loadConfig failed:', e);
-            });
-        } else {
-            _pendingConfig = configJson;
-        }
+        applyConfig(JSON.parse(configJson));
+    };
+
+    window.loadNoteSource = function(source, configJson) {
+        _sourceText = source || '';
+        window.loadConfig(configJson);
+    };
+
+    window.setPreviewHtml = function(html) {
+        _sourceText = html || '';
+        window.loadConfig(JSON.stringify({ markup: { language: 'html', content: html || '' } }));
+    };
+
+    window.focusEditor = function() {
+        _editMode = true;
+        if (_ready) callApi('show', ['editor']);
+    };
+
+    window.setBgColor = function() {};
+
+    window.getSharePayload = function() {
+        const selection = window.getSelection ? String(window.getSelection()) : '';
+        const text = selection.trim() || _sourceText;
+        return { html: text, text: text.replace(/<[^>]+>/g, '').trim() || text, selected: Boolean(selection.trim()) };
     };
 
     window.setEditMode = function(enabled) {
         _editMode = Boolean(enabled);
-        if (!playground) return;
-        if (_editMode) {
-            playground.show('editor');
-        } else {
-            playground.show('result');
-        }
+        if (_ready) callApi('show', [_editMode ? 'editor' : 'result']);
+    };
+
+    window.callLiveCodesApi = function(method, args) {
+        callApi(method, Array.isArray(args) ? args : []);
+    };
+
+    window.callLiveCodesEditCommand = function(command) {
+        postToLiveCodes({ type: 'scratch-edit-command', command: command });
     };
 
     window.getConfig = function() {
-        if (!playground) return Promise.resolve('{}');
-        return playground.getConfig().then(function(config) {
-            return JSON.stringify(config);
-        });
+        return Promise.resolve(JSON.stringify(_config));
     };
 
-    // Kick off playground creation
-    initPlayground(null);
+    initPlayground();
 
-    // Wire QWebChannel
-    new QWebChannel(qt.webChannelTransport, function(channel) {
-        window.Bridge = channel.objects.bridge;
-        if (playground) {
-            Bridge.ready();
-        }
-    });
+    if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            window.Bridge = channel.objects.bridge;
+            if (_ready) Bridge.ready();
+        });
+    } else {
+        console.warn('QWebChannel is not available; running LiveCodes pane without Scratch bridge.');
+    }
 })();
 </script>
 </body>

@@ -20,9 +20,9 @@ import urllib.parse
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QObject, QPoint, QSize, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QIcon, QKeySequence, QShortcut
+from PyQt6.QtGui import QColor, QCursor, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
@@ -35,12 +35,16 @@ from scratch_core import (
     SHORTCUTS,
     Rect,
     create_shortcuts,
+    livecodes_config_from_source,
+    livecodes_source_from_config,
+    livecodes_url,
     ollama_generate_payload,
     ollama_stream_chunks,
     page_title_from_html,
     plain_text_from_html,
     preformatted_html,
     resize_rect,
+    start_livecodes_server,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,7 @@ DATA_FILE    = Path.home() / ".scratch-notes" / "notes.json"
 CONFIG_FILE  = Path.home() / ".scratch-notes" / "config.json"
 ASSETS_DIR   = Path(__file__).parent / "assets"
 EDITOR_URL   = QUrl.fromLocalFile(str(ASSETS_DIR / "editor.html"))
+LIVECODES_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "livecodes_pane.html"))
 TERMINAL_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "terminal.html"))
 SOCKET_PATH  = f"/tmp/scratch-{os.getuid()}.sock"
 
@@ -62,12 +67,12 @@ QSplitter::handle:horizontal { width: 3px; }
 QSplitter::handle:vertical   { height: 4px; }
 QPushButton {
     background: transparent; color: #8b8bac; border: none;
-    font-size: 12px; padding: 4px 6px; border-radius: 5px;
+    font-size: 14px; padding: 2px 4px; border-radius: 5px;
 }
 QPushButton:hover { background: #2d2d4e; color: #e6edf3; }
 QPushButton#command {
     background: rgba(255,255,255,.04); color: #c5d0e0;
-    border: 1px solid rgba(139,139,172,.16); font-weight: 600;
+    border: 1px solid rgba(139,139,172,.16); font-size: 16px; font-weight: 600;
 }
 QPushButton#command:hover { background: #263451; color: #ffffff; }
 QPushButton#mode-on { background: #7ec8a4; color: #0f1720; font-weight: 700; }
@@ -75,9 +80,9 @@ QPushButton#tool-on { background: #7cc4ff; color: #0f1720; font-weight: 700; }
 QPushButton#pin-on  { color: #ffd700; }
 QPushButton#pin-off { color: #4a4a6a; }
 QPushButton#danger  { color: #ff8f9a; }
-QPushButton#add     { color: #7ec8a4; font-size: 14px; font-weight: bold; }
+QPushButton#add     { color: #7ec8a4; font-size: 17px; font-weight: bold; }
 QPushButton#del     { color: #e06c75; }
-QPushButton#nav     { color: #9aacd0; font-size: 12px; }
+QPushButton#nav     { color: #9aacd0; font-size: 14px; }
 QPushButton#nav:hover    { color: #e6edf3; }
 QPushButton#nav:disabled { color: #2d2d4e; }
 QLabel#page-label { color: #9aacd0; font-size: 11px; font-weight: 700; }
@@ -217,6 +222,10 @@ class QuillBridge(QObject):
         QTimer.singleShot(0, lambda: self._pane.view.page().runJavaScript("focusEditor()"))
         QTimer.singleShot(80, lambda: self._pane.view.page().runJavaScript("focusEditor()"))
 
+    @pyqtSlot()
+    def openContextMenu(self):
+        self._pane._pad._open_context_menu_at(QCursor.pos())
+
 
 class TerminalBridge(QObject):
     """Bridge exposing Qt slots for terminal I/O between Python PTY and JS."""
@@ -252,7 +261,7 @@ class TerminalBridge(QObject):
 # ── Quill pane ───────────────────────────────────────────────────────────────
 
 class QuillPane(QWidget):
-    """Container pane hosting the Quill editor QWebEngineView."""
+    """Container pane hosting the LiveCodes-backed editor/preview."""
     content_changed = pyqtSignal(int, str)
 
     def __init__(self, pad, initial_page=0):
@@ -270,9 +279,12 @@ class QuillPane(QWidget):
         self.view.setMinimumSize(QSize(0, 0))
         s = self.view.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         self.view.page().setWebChannel(self.channel)
-        self.view.setUrl(EDITOR_URL)
+        self._install_context_menu_bridge()
+        livecodes_url_obj = QUrl(LIVECODES_URL)
+        livecodes_url_obj.setQuery(urllib.parse.urlencode({"appUrl": self._pad.livecodes_app_url}))
+        self.view.setUrl(livecodes_url_obj)
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.view.installEventFilter(self)
 
@@ -299,17 +311,55 @@ class QuillPane(QWidget):
             self._pending_html = None
         self._pad._apply_bg_color(self)
 
-    def on_content_changed(self, html):
-        self._pad.notes["pages"][self._page_index] = html
+    def on_content_changed(self, content):
+        try:
+            source = livecodes_source_from_config(json.loads(content))
+        except Exception:
+            source = content
+        self._pad.notes["pages"][self._page_index] = source
         self._pad.schedule_save()
-        self.content_changed.emit(self._page_index, html)
+        self.content_changed.emit(self._page_index, source)
 
-    def _send_content(self, html):
+    def _send_content(self, source):
+        config = livecodes_config_from_source(source)
         self.view.page().runJavaScript(
-            f"loadContent({json.dumps(html)}, {json.dumps(html)})")
+            f"loadNoteSource({json.dumps(source)}, {json.dumps(json.dumps(config))})")
 
     def get_share_payload(self, callback):
         self.view.page().runJavaScript("getSharePayload()", callback)
+
+    def run_livecodes_command(self, method, args=None):
+        self.view.page().runJavaScript(
+            f"callLiveCodesApi({json.dumps(method)}, {json.dumps(args or [])})"
+        )
+
+    def run_livecodes_edit_command(self, command):
+        self.view.page().runJavaScript(
+            f"callLiveCodesEditCommand({json.dumps(command)})"
+        )
+
+    def _install_context_menu_bridge(self):
+        script = QWebEngineScript()
+        script.setName("scratch-context-menu-bridge")
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+        script.setSourceCode(
+            """
+            document.addEventListener('contextmenu', function(event) {
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation();
+                window.top.postMessage({ type: 'scratch-open-context-menu' }, '*');
+            }, true);
+            window.addEventListener('message', function(event) {
+                var data = event.data || {};
+                if (data.type !== 'scratch-edit-command' || !data.command) return;
+                document.execCommand(data.command);
+            });
+            """
+        )
+        self.view.page().scripts().insert(script)
 
     def eventFilter(self, obj, event):
         if obj is self.view and event.type() == QEvent.Type.MouseButtonPress:
@@ -333,18 +383,24 @@ class DragHandle(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._drag_pos = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = (e.globalPosition().toPoint()
                               - self.window().frameGeometry().topLeft())
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
 
     def mouseMoveEvent(self, e):
         if self._drag_pos and e.buttons() == Qt.MouseButton.LeftButton:
             self.window().move(e.globalPosition().toPoint() - self._drag_pos)
+            e.accept()
 
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        e.accept()
 
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and hasattr(self.window(), "_toggle_pin"):
@@ -571,6 +627,13 @@ class ScratchPad(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._flush_save)
 
+        self.livecodes_app_url = livecodes_url()
+        try:
+            self._livecodes_thread, livecodes_port = start_livecodes_server()
+            self.livecodes_app_url = livecodes_url(livecodes_port)
+        except Exception as e:
+            logger.warning("LiveCodes server was not started by Scratch: %s", e)
+
         self._ollama_chunk.connect(self._on_ollama_chunk)
         self._ollama_done.connect(self._on_ollama_done)
 
@@ -723,14 +786,14 @@ class ScratchPad(QWidget):
 
         topbar = DragHandle(self)
         topbar.setObjectName("topbar")
-        topbar.setFixedHeight(40)
+        topbar.setFixedHeight(38)
         top = QHBoxLayout(topbar)
-        top.setContentsMargins(7, 0, 7, 0)
+        top.setContentsMargins(6, 0, 6, 0)
         top.setSpacing(4)
 
-        def btn(label, size=30, obj_name="command", tip=None):
+        def btn(label, size=28, obj_name="command", tip=None):
             b = QPushButton(label)
-            b.setFixedSize(QSize(size, 28))
+            b.setFixedSize(QSize(size, 26))
             if obj_name: b.setObjectName(obj_name)
             if tip:      b.setToolTip(tip)
             return b
@@ -1148,13 +1211,16 @@ class ScratchPad(QWidget):
                 pane._send_content(html)
         self._update_nav()
 
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.setStyleSheet(
+    def _context_menu_style(self):
+        return (
             "QMenu { background:#16213e; color:#e6edf3; border:1px solid #2d2d4e; }"
             "QMenu::item { padding:6px 24px; }"
             "QMenu::item:selected { background:#2d2d4e; }"
         )
+
+    def _build_context_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(self._context_menu_style())
 
         def add_action(label, shortcut=None):
             action = menu.addAction(label)
@@ -1171,6 +1237,18 @@ class ScratchPad(QWidget):
         ask_act = add_action("Ask Ollama", "Ctrl+Shift+A")
         term_act = add_action("Toggle terminal", "Ctrl+T")
         split_act = add_action("Split / unsplit", "Ctrl+\\")
+        menu.addSeparator()
+        livecodes_menu = menu.addMenu("LiveCodes")
+        lc_editor_act = livecodes_menu.addAction("Show editor")
+        lc_result_act = livecodes_menu.addAction("Show result")
+        lc_toggle_result_act = livecodes_menu.addAction("Toggle result")
+        lc_run_act = livecodes_menu.addAction("Run project")
+        lc_format_act = livecodes_menu.addAction("Format code")
+        livecodes_menu.addSeparator()
+        lc_cut_act = livecodes_menu.addAction("Cut")
+        lc_copy_act = livecodes_menu.addAction("Copy")
+        lc_paste_act = livecodes_menu.addAction("Paste")
+        lc_select_all_act = livecodes_menu.addAction("Select all")
         menu.addSeparator()
         share_menu = menu.addMenu("Share")
         share_copy_act = share_menu.addAction("Copy share text")
@@ -1203,35 +1281,55 @@ class ScratchPad(QWidget):
         hide_act = add_action("Hide to tray", "Ctrl+H")
         quit_act = add_action("Quit", "Ctrl+Q")
 
+        return menu, {
+            edit_act: self._toggle_edit_mode,
+            new_act: self._new_page,
+            prev_act: self._prev_page,
+            next_act: self._next_page,
+            delete_act: self._delete_page,
+            ask_act: self._ask_ollama,
+            term_act: self._toggle_terminal,
+            split_act: self._toggle_split_panes,
+            config_act: self._open_config_panel,
+            color_act: self._pick_bg_color,
+            export_act: self._export_page,
+            pin_act: self._toggle_pin,
+            hide_act: self.hide,
+            quit_act: self._quit,
+            lc_editor_act: lambda: self._run_livecodes_action("show", ["editor"]),
+            lc_result_act: lambda: self._run_livecodes_action("show", ["result"]),
+            lc_toggle_result_act: lambda: self._run_livecodes_action("show", ["toggle-result"]),
+            lc_run_act: lambda: self._run_livecodes_action("run"),
+            lc_format_act: lambda: self._run_livecodes_action("format"),
+            lc_cut_act: lambda: self._run_livecodes_edit_action("cut"),
+            lc_copy_act: lambda: self._run_livecodes_edit_action("copy"),
+            lc_paste_act: lambda: self._run_livecodes_edit_action("paste"),
+            lc_select_all_act: lambda: self._run_livecodes_edit_action("selectAll"),
+        }
+
+    def _open_context_menu_at(self, global_pos):
+        menu, actions = self._build_context_menu()
+        action = menu.exec(global_pos)
+        handler = actions.get(action)
+        if handler:
+            handler()
+
+    def contextMenuEvent(self, event):
+        menu, actions = self._build_context_menu()
         action = menu.exec(event.globalPos())
-        if action == edit_act:
-            self._toggle_edit_mode()
-        elif action == new_act:
-            self._new_page()
-        elif action == prev_act:
-            self._prev_page()
-        elif action == next_act:
-            self._next_page()
-        elif action == delete_act:
-            self._delete_page()
-        elif action == ask_act:
-            self._ask_ollama()
-        elif action == term_act:
-            self._toggle_terminal()
-        elif action == split_act:
-            self._toggle_split_panes()
-        elif action == config_act:
-            self._open_config_panel()
-        elif action == color_act:
-            self._pick_bg_color()
-        elif action == export_act:
-            self._export_page()
-        elif action == pin_act:
-            self._toggle_pin()
-        elif action == hide_act:
-            self.hide()
-        elif action == quit_act:
-            self._quit()
+        handler = actions.get(action)
+        if handler:
+            handler()
+
+    def _run_livecodes_action(self, method, args=None):
+        pane = self._active_pane()
+        if pane and pane._editor_ready:
+            pane.run_livecodes_command(method, args or [])
+
+    def _run_livecodes_edit_action(self, command):
+        pane = self._active_pane()
+        if pane and pane._editor_ready:
+            pane.run_livecodes_edit_command(command)
 
     def _apply_bg_color(self, pane):
         if self._bg_color and pane._editor_ready:

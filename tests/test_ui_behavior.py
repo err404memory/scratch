@@ -80,6 +80,24 @@ def test_editor_exposes_selected_share_payload():
     assert "window.getSharePayload = getSharePayload;" in editor_html
 
 
+def test_livecodes_pane_exposes_scratch_bridge_contract():
+    livecodes_html = Path("assets/livecodes_pane.html").read_text()
+
+    assert "livecodes-frame" in livecodes_html
+    assert "livecodes-get-config" in livecodes_html
+    assert "livecodes-ready" in livecodes_html
+    assert "livecodes-change" in livecodes_html
+    assert "scratch-open-context-menu" in livecodes_html
+    assert "callApi('setConfig'" in livecodes_html
+    assert "window.callLiveCodesApi" in livecodes_html
+    assert "window.callLiveCodesEditCommand" in livecodes_html
+    assert "url.searchParams.set('config', 'sdk')" not in livecodes_html
+    assert "window.loadNoteSource" in livecodes_html
+    assert "window.getSharePayload" in livecodes_html
+    assert "window.focusEditor" in livecodes_html
+    assert "Bridge.contentChanged(JSON.stringify(cfg))" in livecodes_html
+
+
 def test_scratch_ui_exposes_low_friction_commands():
     scratch_source = Path("scratch.py").read_text()
 
@@ -95,13 +113,28 @@ def test_scratch_ui_exposes_low_friction_commands():
     assert '"telegram":' in scratch_source
     assert '"share_targets":' in scratch_source
     assert "getSharePayload()" in scratch_source
+    assert "livecodes_config_from_source" in scratch_source
+    assert "start_livecodes_server()" in scratch_source
+    assert "LIVECODES_URL" in scratch_source
+    assert "LocalContentCanAccessRemoteUrls, True" in scratch_source
     assert "def wheelEvent(self, event):" in scratch_source
     assert "mouseDoubleClickEvent" in scratch_source
+    assert "OpenHandCursor" in scratch_source
+    assert "ClosedHandCursor" in scratch_source
     assert "class ResizeHandle(QFrame):" in scratch_source
     assert "def _install_resize_handles(self):" in scratch_source
     assert '"top-left"' in scratch_source
     assert "current_geometry = (self.x(), self.y(), self.width(), self.height())" in scratch_source
     assert "self._init_geometry = current_geometry" in scratch_source
+    assert "scratch-context-menu-bridge" in scratch_source
+    assert "scratch-edit-command" in scratch_source
+    assert "def _build_context_menu(self):" in scratch_source
+    assert "LiveCodes" in scratch_source
+    assert "Select all" in scratch_source
+    assert "def _run_livecodes_action(self, method, args=None):" in scratch_source
+    assert "def _run_livecodes_edit_action(self, command):" in scratch_source
+    assert "font-size: 16px" in scratch_source
+    assert "QSize(size, 26)" in scratch_source
 
 @pytest.fixture(scope="session")
 def qt_app():

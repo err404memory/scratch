@@ -222,6 +222,61 @@ def test_default_livecodes_config():
     assert cfg == {"markup": {"language": "markdown", "content": "# hello"}}
 
 
+def test_livecodes_url_uses_loopback_alias_to_avoid_dev_sandbox():
+    assert scratch_core.livecodes_url(4173) == "http://127.0.0.2:4173/"
+
+
+def test_livecodes_config_detects_html_markdown_and_css():
+    html_cfg = scratch_core.livecodes_config_from_source("<h1>Hello</h1>")
+    md_cfg = scratch_core.livecodes_config_from_source("# Hello")
+    css_cfg = scratch_core.livecodes_config_from_source("body { background: tomato; }")
+
+    assert html_cfg["markup"]["language"] == "html"
+    assert md_cfg["markup"]["language"] == "markdown"
+    assert css_cfg["markup"]["language"] == "html"
+    assert css_cfg["style"]["language"] == "css"
+    assert "scratch-css-preview" in css_cfg["markup"]["content"]
+
+
+def test_livecodes_config_splits_fenced_blocks():
+    source = """```html
+<h1>Hello</h1>
+```
+
+```css
+h1 { color: red; }
+```
+
+```js
+console.log("hi")
+```"""
+
+    cfg = scratch_core.livecodes_config_from_source(source)
+
+    assert cfg["markup"]["language"] == "html"
+    assert cfg["markup"]["content"] == "<h1>Hello</h1>"
+    assert cfg["style"]["content"] == "h1 { color: red; }"
+    assert cfg["script"]["language"] == "javascript"
+
+
+def test_livecodes_source_round_trips_config_without_css_placeholder():
+    cfg = {
+        "markup": {"language": "html", "content": scratch_core.CSS_PREVIEW_MARKUP},
+        "style": {"language": "css", "content": "body { color: red; }"},
+    }
+
+    source = scratch_core.livecodes_source_from_config(cfg)
+
+    assert "scratch-css-preview" not in source
+    assert source == "```css\nbody { color: red; }\n```"
+
+
+def test_livecodes_source_keeps_simple_html_plain():
+    cfg = {"markup": {"language": "html", "content": "<h1>Hello</h1>"}}
+
+    assert scratch_core.livecodes_source_from_config(cfg) == "<h1>Hello</h1>"
+
+
 def test_page_title_from_config_extracts_markup():
     cfg = {"markup": {"language": "markdown", "content": "# My Title\n\nBody text"}}
     assert scratch_core.page_title_from_config(cfg, limit=20) == "My Title"
