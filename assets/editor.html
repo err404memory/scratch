@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy"
-      content="default-src 'self' qrc:; script-src 'self' qrc:; style-src 'self' 'unsafe-inline';">
+      content="default-src 'self' qrc:; script-src 'self' qrc: 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -76,6 +76,69 @@ let _editMode = false;
 let _content  = '';
 let _bgColor  = '';
 
+function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#x27;'
+    }[ch]));
+}
+
+function preserveTextNewlines(source) {
+    return String(source || '')
+        .split(/(<[^>]+>)/g)
+        .map(part => {
+            if (part.startsWith('<') && part.endsWith('>')) return part;
+            if (!part.includes('\n')) return part;
+            if (!part.trim()) return '';
+            return part.replace(/\r?\n/g, '<br>');
+        })
+        .join('');
+}
+
+function renderNoteSource(source) {
+    const text = source || '';
+    if (!/^\s*(```|~~~)/m.test(text)) return preserveTextNewlines(text);
+
+    const lines = text.split(/\r?\n/);
+    const rendered = [];
+    let inCode = false;
+    let codeLineCount = 0;
+
+    for (const line of lines) {
+        const fence = line.match(/^\s*(```|~~~)\s*([A-Za-z0-9_-]*)\s*$/);
+        if (fence) {
+            if (inCode) {
+                rendered.push('</code></pre>');
+                inCode = false;
+                codeLineCount = 0;
+            } else {
+                const lang = fence[2] ? ` class="language-${escapeHtml(fence[2])}"` : '';
+                rendered.push(`<pre><code${lang}>`);
+                inCode = true;
+                codeLineCount = 0;
+            }
+            continue;
+        }
+
+        if (inCode) {
+            if (codeLineCount === 0) {
+                rendered[rendered.length - 1] += escapeHtml(line);
+            } else {
+                rendered.push(escapeHtml(line));
+            }
+            codeLineCount += 1;
+        } else {
+            rendered.push(preserveTextNewlines(line));
+        }
+    }
+
+    if (inCode) rendered.push('</code></pre>');
+    return rendered.join('\n');
+}
+
 function buildWrapper(bodyHtml) {
     const bg = _bgColor || 'linear-gradient(160deg,#f8f6f1 0%,#edeae0 100%)';
     return `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
@@ -101,8 +164,9 @@ function buildWrapper(bodyHtml) {
 
 function renderPreview(html) {
     const isFullDoc = /^\s*<!doctype|^\s*<html/i.test(html);
+    const bodyHtml = isFullDoc ? html : renderNoteSource(html);
     frame.srcdoc = html
-        ? (isFullDoc ? html : buildWrapper(html))
+        ? (isFullDoc ? html : buildWrapper(bodyHtml))
         : buildWrapper('<p style="color:#9aa0ab;font-style:italic;">Start writing…</p>');
 }
 
@@ -115,13 +179,19 @@ function loadContent(html, _unused) {
     _content = html || '';
     editor.value = _content;
     renderPreview(_content);
-    if (_editMode) editor.focus();
+    if (_editMode) focusEditor();
+}
+
+function focusEditor() {
+    if (!_editMode) return;
+    editor.focus();
+    editor.setSelectionRange(editor.value.length, editor.value.length);
 }
 
 function setEditMode(enabled) {
     _editMode = Boolean(enabled);
     document.body.classList.toggle('edit-mode', _editMode);
-    if (_editMode) setTimeout(() => editor.focus(), 0);
+    if (_editMode) setTimeout(focusEditor, 0);
 }
 
 function setPreviewHtml(html) {
@@ -130,10 +200,26 @@ function setPreviewHtml(html) {
     renderPreview(_content);
 }
 
+function getSharePayload() {
+    const previewSelection = frame.contentWindow?.getSelection?.()?.toString() || '';
+    if (previewSelection.trim()) {
+        return { html: previewSelection, text: previewSelection.trim(), selected: true };
+    }
+    const start = editor.selectionStart ?? 0;
+    const end = editor.selectionEnd ?? 0;
+    const selected = end > start;
+    const html = selected ? editor.value.slice(start, end) : _content;
+    const text = html.replace(/<[^>]+>/g, '').trim() || html;
+    return { html, text, selected };
+}
+
 document.getElementById('preview-overlay').addEventListener('click', () => {
     setEditMode(true);
     if (window.Bridge) Bridge.requestFocus();
 });
+
+window.focusEditor = focusEditor;
+window.getSharePayload = getSharePayload;
 
 editor.addEventListener('input', () => {
     _content = editor.value;

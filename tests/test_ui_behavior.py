@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import pytest
 from PyQt6.QtCore import QEvent, Qt
@@ -12,11 +13,104 @@ def _has_display() -> bool:
     """Check if a DISPLAY is available (X11/Wayland)."""
     return bool(os.environ.get("DISPLAY") or sys.platform == "darwin")
 
+
+def _qt_platform_is_usable() -> bool:
+    """Probe Qt in a child process so plugin aborts do not kill pytest."""
+    code = (
+        "import sys\n"
+        "from PyQt6.QtWebEngineWidgets import QWebEngineView\n"
+        "from PyQt6.QtWidgets import QApplication\n"
+        "app = QApplication([])\n"
+        "QWebEngineView()\n"
+        "print(app.platformName())\n"
+    )
+    env = os.environ.copy()
+    env.setdefault("QT_QPA_PLATFORM", "xcb")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0
+
+
+def test_editor_page_has_explicit_focus_contract():
+    editor_html = Path("assets/editor.html").read_text()
+
+    assert "function focusEditor()" in editor_html
+    assert "window.focusEditor = focusEditor;" in editor_html
+    assert "focusEditor();" in editor_html
+
+
+def test_editor_csp_allows_inline_bootstrap_script():
+    editor_html = Path("assets/editor.html").read_text()
+
+    assert "script-src 'self' qrc: 'unsafe-inline'" in editor_html
+
+
+def test_editor_preview_preserves_typed_newlines():
+    editor_html = Path("assets/editor.html").read_text()
+
+    assert "function preserveTextNewlines(source)" in editor_html
+    assert ".replace(/\\r?\\n/g, '<br>')" in editor_html
+    assert "white-space:pre-wrap" not in editor_html
+
+
+def test_editor_preview_renders_code_fences():
+    editor_html = Path("assets/editor.html").read_text()
+
+    assert "function renderNoteSource(source)" in editor_html
+    assert "<pre><code${lang}>" in editor_html
+    assert "renderNoteSource(html)" in editor_html
+    assert "codeLineCount === 0" in editor_html
+
+
+def test_editor_exposes_selected_share_payload():
+    editor_html = Path("assets/editor.html").read_text()
+
+    assert "function getSharePayload()" in editor_html
+    assert "previewSelection.trim()" in editor_html
+    assert "editor.selectionStart" in editor_html
+    assert "window.getSharePayload = getSharePayload;" in editor_html
+
+
+def test_scratch_ui_exposes_low_friction_commands():
+    scratch_source = Path("scratch.py").read_text()
+
+    assert 'btn("✎"' in scratch_source
+    assert 'btn("+"' in scratch_source
+    assert 'btn("⇪"' in scratch_source
+    assert 'btn("⚙"' in scratch_source
+    assert 'add_action("Edit preview", "Ctrl+E")' in scratch_source
+    assert 'add_action("Background color...", "Ctrl+B")' in scratch_source
+    assert "def _open_share_menu(self):" in scratch_source
+    assert "class ConfigDialog(QDialog):" in scratch_source
+    assert '"Copy for AI"' in scratch_source
+    assert '"telegram":' in scratch_source
+    assert '"share_targets":' in scratch_source
+    assert "getSharePayload()" in scratch_source
+    assert "def wheelEvent(self, event):" in scratch_source
+    assert "mouseDoubleClickEvent" in scratch_source
+    assert "class ResizeHandle(QFrame):" in scratch_source
+    assert "def _install_resize_handles(self):" in scratch_source
+    assert '"top-left"' in scratch_source
+    assert "current_geometry = (self.x(), self.y(), self.width(), self.height())" in scratch_source
+    assert "self._init_geometry = current_geometry" in scratch_source
+
 @pytest.fixture(scope="session")
 def qt_app():
     """Start QApplication once for session, with WebEngine support."""
     if not _has_display():
         pytest.skip("UI tests require a display (DISPLAY not set)")
+
+    if not _qt_platform_is_usable():
+        pytest.skip("UI tests require a usable Qt platform plugin")
 
     # Ensure XCB platform for override-redirect windows
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")

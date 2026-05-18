@@ -27,7 +27,12 @@ SHORTCUTS: list[tuple[str, str]] = [
     ("Ctrl+T", "_toggle_terminal"),
     ("Ctrl+E", "_toggle_edit_mode"),
     ("Ctrl+\\", "_split_pane"),
+    ("Ctrl+Shift+\\", "_close_extra_panes"),
     ("Ctrl+S", "_export_page"),
+    ("Ctrl+B", "_pick_bg_color"),
+    ("Ctrl+P", "_toggle_pin"),
+    ("Ctrl+Shift+S", "_open_share_menu"),
+    ("Ctrl+,", "_open_config_panel"),
     ("Ctrl+Shift+A", "_ask_ollama"),
     ("Ctrl+H", "hide"),
     ("Ctrl+Q", "_quit"),
@@ -128,6 +133,53 @@ def plain_text_from_html(html: str) -> str:
     return re.sub(r"<[^>]+>", "", html)
 
 
+def preformatted_html(text: str) -> str:
+    """Wrap generated plain text in a pre block without treating it as markup."""
+    return f"<pre>{html.escape(text)}</pre>"
+
+
+def preserve_text_newlines(source: str) -> str:
+    """Preserve text newlines without making whitespace between HTML tags visible."""
+    parts = re.split(r"(<[^>]+>)", source)
+    rendered: list[str] = []
+    for part in parts:
+        if re.fullmatch(r"<[^>]+>", part or ""):
+            rendered.append(part)
+        elif "\n" not in part and "\r" not in part:
+            rendered.append(part)
+        elif part.strip():
+            rendered.append(part.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>"))
+    return "".join(rendered)
+
+
+def wrap_note_body(body_html: str) -> str:
+    """Wrap preview body HTML with the same styling used by the live editor."""
+    bg = "linear-gradient(160deg,#f8f6f1 0%,#edeae0 100%)"
+    return (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>'
+        f'body{{background:{bg};color:#1c2430;'
+        'font-family:Inter,system-ui,sans-serif;font-size:13px;line-height:1.6;'
+        'margin:0;padding:18px 20px;min-height:100vh;}'
+        'h1,h2,h3{color:#16324f;margin:.2em 0 .5em;line-height:1.2;}'
+        'h1{font-size:1.45rem;}h2{font-size:1.2rem;}h3{font-size:1rem;}'
+        'p,ul,ol,pre,blockquote,details{margin:.7em 0;}'
+        'a{color:#5c7cfa;}'
+        'code{background:rgba(22,50,79,.09);color:#0f3b63;padding:1px 5px;border-radius:4px;'
+        'font-family:ui-monospace,monospace;}'
+        'pre{background:#15202b;color:#d7e0ea;padding:14px;border-radius:10px;overflow:auto;}'
+        'pre code{background:transparent;color:inherit;padding:0;}'
+        'blockquote{border-left:4px solid #9aacb8;padding-left:12px;color:#4e5968;}'
+        'table{border-collapse:collapse;}td,th{border:1px solid rgba(35,44,58,.15);padding:4px 8px;}'
+        'img{max-width:100%;}'
+        'details{border:1px solid rgba(35,44,58,.15);border-radius:8px;padding:8px 12px;}'
+        'summary{cursor:pointer;font-weight:600;color:#16324f;}'
+        '::-webkit-scrollbar{width:0;height:0;}'
+        '</style></head><body>'
+        f'{body_html}'
+        '</body></html>'
+    )
+
+
 def render_note_source(source: str) -> str:
     """
     Convert raw note content (markdown or HTML) to a complete HTML document.
@@ -151,10 +203,14 @@ def render_note_source(source: str) -> str:
     if source.lower().startswith(("<!doctype html", "<!doctype html", "<html")):
         return source
 
+    if source.lstrip().startswith("<"):
+        return wrap_note_body(preserve_text_newlines(source))
+
     # Basic markdown → HTML conversion (covers test cases)
     lines = source.splitlines()
     in_code_block = False
     code_lang = ""
+    code_line_count = 0
     rendered_lines: list[str] = []
 
     for line in lines:
@@ -164,17 +220,28 @@ def render_note_source(source: str) -> str:
                 rendered_lines.append("</code></pre>")
                 in_code_block = False
                 code_lang = ""
+                code_line_count = 0
             else:
                 fence = line.strip()[:3]
                 lang = line.strip()[3:].strip()
                 code_lang = lang or ""
-                rendered_lines.append(f'<pre><code class="language-{code_lang}"' if code_lang else '<pre><code>')
+                rendered_lines.append(
+                    f'<pre><code class="language-{html.escape(code_lang, quote=True)}">'
+                    if code_lang
+                    else "<pre><code>"
+                )
                 in_code_block = True
+                code_line_count = 0
             continue
 
         if in_code_block:
-            # Inside code block — escape HTML and append as-is
-            rendered_lines.append(html.escape(line))
+            # Attach the first code line to the opening tag so <pre> does not
+            # render an artificial leading blank line.
+            if code_line_count == 0:
+                rendered_lines[-1] += html.escape(line)
+            else:
+                rendered_lines.append(html.escape(line))
+            code_line_count += 1
             continue
 
         # ATX headings (1-6 #)
@@ -201,30 +268,7 @@ def render_note_source(source: str) -> str:
 
     # Join and wrap with default styling (mirrors editor.html buildWrapper)
     body_html = "\n".join(rendered_lines)
-    bg = "linear-gradient(160deg,#f8f6f1 0%,#edeae0 100%)"
-    return (
-        '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>'
-        f'body{{background:{bg};color:#1c2430;'
-        'font-family:Inter,system-ui,sans-serif;font-size:13px;line-height:1.6;'
-        'margin:0;padding:18px 20px;min-height:100vh;}'
-        'h1,h2,h3{color:#16324f;margin:.2em 0 .5em;line-height:1.2;}'
-        'h1{font-size:1.45rem;}h2{font-size:1.2rem;}h3{font-size:1rem;}'
-        'p,ul,ol,pre,blockquote,details{margin:.7em 0;}'
-        'a{color:#5c7cfa;}'
-        'code{background:rgba(22,50,79,.09);color:#0f3b63;padding:1px 5px;border-radius:4px;'
-        'font-family:ui-monospace,monospace;}'
-        'pre{background:#15202b;color:#d7e0ea;padding:14px;border-radius:10px;overflow:auto;}'
-        'pre code{background:transparent;color:inherit;padding:0;}'
-        'blockquote{border-left:4px solid #9aacb8;padding-left:12px;color:#4e5968;}'
-        'table{border-collapse:collapse;}td,th{border:1px solid rgba(35,44,58,.15);padding:4px 8px;}'
-        'img{max-width:100%;}'
-        'details{{border:1px solid rgba(35,44,58,.15);border-radius:8px;padding:8px 12px;}}'
-        'summary{{cursor:pointer;font-weight:600;color:#16324f;}}'
-        '::-webkit-scrollbar{{width:0;height:0;}}'
-        '</style></head><body>'
-        f'{body_html}'
-        '</body></html>'
-    )
+    return wrap_note_body(body_html)
 
 
 def page_title_from_config(config: dict[str, Any], limit: int = 40) -> str:

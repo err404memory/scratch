@@ -43,6 +43,51 @@ print("hi")
     assert "<summary>More</summary>" in rendered
 
 
+def test_render_note_source_closes_language_code_tag():
+    rendered = scratch_core.render_note_source("```python\nprint('hi')\n```")
+
+    assert '<pre><code class="language-python">' in rendered
+    assert '<pre><code class="language-python"\n' not in rendered
+    assert '<pre><code class="language-python">print' in rendered
+
+
+def test_render_note_source_emits_valid_css_braces():
+    rendered = scratch_core.render_note_source("# Scratch")
+
+    assert "details{" in rendered
+    assert "details{{" not in rendered
+    assert "summary{" in rendered
+    assert "summary{{" not in rendered
+
+
+def test_render_note_source_preserves_typed_newlines():
+    rendered = scratch_core.render_note_source("first\nsecond")
+
+    assert "<p>first</p>" in rendered
+    assert "<p>second</p>" in rendered
+    assert "white-space:pre-wrap" not in rendered
+
+
+def test_preserve_text_newlines_ignores_whitespace_between_tags():
+    source = "<h3>heading</h3>\n<ol>\n<li>item</li>\n<li>item</li>\n</ol>"
+
+    rendered = scratch_core.preserve_text_newlines(source)
+
+    assert rendered == "<h3>heading</h3><ol><li>item</li><li>item</li></ol>"
+
+
+def test_preserve_text_newlines_keeps_text_breaks():
+    rendered = scratch_core.preserve_text_newlines("first\nsecond")
+
+    assert rendered == "first<br>second"
+
+
+def test_preformatted_html_escapes_generated_text():
+    rendered = scratch_core.preformatted_html("a <b>tag</b> & value")
+
+    assert rendered == "<pre>a &lt;b&gt;tag&lt;/b&gt; &amp; value</pre>"
+
+
 def test_migrate_notes_converts_plain_text_pages_only():
     calls: list[str] = []
 
@@ -118,6 +163,21 @@ def test_create_shortcuts_retains_each_binding():
     assert parent.calls == ["new", "delete"]
 
 
+def test_shortcuts_cover_visible_command_strip_actions():
+    bindings = dict(scratch_core.SHORTCUTS)
+
+    assert bindings["Ctrl+E"] == "_toggle_edit_mode"
+    assert bindings["Ctrl+N"] == "_new_page"
+    assert bindings["Ctrl+T"] == "_toggle_terminal"
+    assert bindings["Ctrl+\\"] == "_split_pane"
+    assert bindings["Ctrl+Shift+\\"] == "_close_extra_panes"
+    assert bindings["Ctrl+B"] == "_pick_bg_color"
+    assert bindings["Ctrl+S"] == "_export_page"
+    assert bindings["Ctrl+P"] == "_toggle_pin"
+    assert bindings["Ctrl+Shift+S"] == "_open_share_menu"
+    assert bindings["Ctrl+,"] == "_open_config_panel"
+
+
 def test_hit_test_resize_edges_prefers_corners():
     rect = scratch_core.Rect(10, 20, 300, 200)
 
@@ -140,6 +200,18 @@ def test_resize_rect_clamps_to_minimum_size():
     assert resized.x == 120
     assert resized.width == 280
     assert resized.height == 200
+
+
+def test_resize_rect_handles_all_edges_and_corners():
+    start = scratch_core.Rect(100, 100, 300, 200)
+
+    top = scratch_core.resize_rect(start, (100, 100), (100, 80), "top")
+    right = scratch_core.resize_rect(start, (400, 100), (450, 100), "right")
+    bottom_left = scratch_core.resize_rect(start, (100, 300), (80, 340), "bottom-left")
+
+    assert top == scratch_core.Rect(100, 80, 300, 220)
+    assert right == scratch_core.Rect(100, 100, 350, 200)
+    assert bottom_left == scratch_core.Rect(80, 100, 320, 240)
 
 
 # ── LiveCodes config helpers ─────────────────────────────────────────────────
