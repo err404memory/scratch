@@ -390,18 +390,29 @@ class QuillPane(QWidget):
             self._pending_html = None
 
     def on_content_changed(self, content):
+        target_page = self._page_index
         try:
-            source = livecodes_source_from_config(json.loads(content))
+            payload = json.loads(content)
+            if isinstance(payload, dict) and "config" in payload:
+                target_page = int(payload.get("scratchPageId", target_page))
+                payload = payload.get("config", {})
+            source = livecodes_source_from_config(payload)
         except Exception:
             source = content
-        self._pad.notes["pages"][self._page_index] = source
+        if target_page < 0 or target_page >= len(self._pad.notes["pages"]):
+            return
+        self._pad.notes["pages"][target_page] = source
         self._pad.schedule_save()
-        self.content_changed.emit(self._page_index, source)
+        self.content_changed.emit(target_page, source)
 
     def _send_content(self, source):
         config = livecodes_config_from_source(source)
         self.view.page().runJavaScript(
-            f"loadNoteSource({json.dumps(source)}, {json.dumps(json.dumps(config))})")
+            f"loadNoteSource({json.dumps(source)}, {json.dumps(json.dumps(config))}, {self._page_index})")
+
+    def capture_current_content(self):
+        if self._editor_ready:
+            self.view.page().runJavaScript(f"captureLiveCodesConfig({self._page_index})")
 
     def get_share_payload(self, callback):
         self.view.page().runJavaScript("getSharePayload()", callback)
@@ -1158,6 +1169,15 @@ class ScratchPad(QWidget):
                 pane._send_content(html)
         self._update_nav()
 
+    def _capture_active_content(self):
+        pane = self._active_pane()
+        if pane and pane._editor_ready:
+            pane.capture_current_content()
+
+    def _after_content_snapshot(self, callback, delay_ms=140):
+        self._capture_active_content()
+        QTimer.singleShot(delay_ms, callback)
+
     def _split_pane(self):
         if len(self._panes) >= 3:
             return
@@ -1242,20 +1262,24 @@ class ScratchPad(QWidget):
     def _prev_page(self):
         pane = self._active_pane()
         if pane.page_index > 0:
-            pane.load_page(pane.page_index - 1)
-            self._flush_save()
-            self._update_nav()
+            self._after_content_snapshot(lambda target=pane.page_index - 1: self._load_active_page(target))
 
     def _next_page(self):
         pane = self._active_pane()
         if pane.page_index < len(self.notes["pages"]) - 1:
-            pane.load_page(pane.page_index + 1)
-            self._flush_save()
-            self._update_nav()
+            self._after_content_snapshot(lambda target=pane.page_index + 1: self._load_active_page(target))
+
+    def _load_active_page(self, index):
+        self._active_pane().load_page(index)
+        self._flush_save()
+        self._update_nav()
 
     def _new_page(self):
-        self._flush_save()
         idx = self._active_pane().page_index
+        self._after_content_snapshot(lambda idx=idx: self._new_page_after_snapshot(idx))
+
+    def _new_page_after_snapshot(self, idx):
+        self._flush_save()
         self.notes["pages"].insert(idx + 1, "")
         self._active_pane().load_page(idx + 1)
         self._flush_save()

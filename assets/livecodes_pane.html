@@ -44,8 +44,11 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
     let _pendingConfig = null;
     let _sourceText = '';
     let _editMode = true;
+    let _pageId = 0;
     let _config = { markup: { language: 'markdown', content: '' } };
     let _apiId = 0;
+    let _pendingApi = {};
+    let _lastEmittedConfigJson = '';
 
     function sourceFromConfig(config) {
         const markup = config && config.markup ? config.markup : {};
@@ -77,6 +80,19 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         postToLiveCodes({ method, id: String(++_apiId), args: args || [] });
     }
 
+    function callApiWithResponse(method, args) {
+        const id = String(++_apiId);
+        postToLiveCodes({ method, id, args: args || [] });
+        return new Promise(function(resolve, reject) {
+            _pendingApi[id] = { resolve, reject };
+            setTimeout(function() {
+                if (!_pendingApi[id]) return;
+                delete _pendingApi[id];
+                reject(new Error(method + ' timed out'));
+            }, 1500);
+        });
+    }
+
     function completeConfig(config) {
         const cfg = config || {};
         const markup = cfg.markup || {};
@@ -93,12 +109,39 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
     function applyConfig(config) {
         _config = completeConfig({ mode: 'lite', view: _editMode ? 'editor' : 'result', ...(config || {}) });
         _sourceText = sourceFromConfig(_config);
+        _lastEmittedConfigJson = JSON.stringify(_config);
         if (_ready) {
             callApi('setConfig', [_config]);
             callApi('show', [_editMode ? 'editor' : 'result']);
         } else {
             _pendingConfig = JSON.stringify(_config);
         }
+    }
+
+    function emitContentChanged(config, pageId, force) {
+        const complete = completeConfig(config);
+        const serialized = JSON.stringify(complete);
+        _config = complete;
+        _sourceText = sourceFromConfig(complete);
+        if (!force && serialized === _lastEmittedConfigJson) return;
+        _lastEmittedConfigJson = serialized;
+        if (window.Bridge) {
+            Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete }));
+        }
+    }
+
+    function snapshotConfig(pageId, force) {
+        if (!_ready) return Promise.resolve(false);
+        const targetPage = Number.isInteger(pageId) ? pageId : _pageId;
+        return callApiWithResponse('getConfig', [true])
+            .then(function(config) {
+                emitContentChanged(config, targetPage, Boolean(force));
+                return true;
+            })
+            .catch(function(err) {
+                console.warn('Scratch autosave snapshot failed:', err);
+                return false;
+            });
     }
 
     function initPlayground() {
@@ -117,6 +160,14 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
     window.addEventListener('message', function(event) {
         if (event.origin !== appOrigin()) return;
         const data = event.data || {};
+        if (data.type === 'livecodes-api-response') {
+            const pending = _pendingApi[data.id];
+            if (!pending) return;
+            delete _pendingApi[data.id];
+            if (data.payload && data.payload.error) pending.reject(data.payload.error);
+            else pending.resolve(data.payload);
+            return;
+        }
         if (data.type === 'livecodes-get-config') {
             postToLiveCodes({ type: 'livecodes-config', payload: _config });
             return;
@@ -134,9 +185,7 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         if (data.type === 'livecodes-change') {
             const cfg = data.payload && data.payload.config ? data.payload.config : data.payload;
             if (!cfg) return;
-            _config = cfg;
-            _sourceText = sourceFromConfig(cfg);
-            if (window.Bridge) Bridge.contentChanged(JSON.stringify(cfg));
+            emitContentChanged(cfg, _pageId, false);
             return;
         }
         if (data.type === 'scratch-open-context-menu') {
@@ -148,7 +197,8 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         applyConfig(JSON.parse(configJson));
     };
 
-    window.loadNoteSource = function(source, configJson) {
+    window.loadNoteSource = function(source, configJson, pageId) {
+        _pageId = Number.isInteger(pageId) ? pageId : _pageId;
         _sourceText = source || '';
         window.loadConfig(configJson);
     };
@@ -184,11 +234,18 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         postToLiveCodes({ type: 'scratch-edit-command', command: command });
     };
 
+    window.captureLiveCodesConfig = function(pageId) {
+        return snapshotConfig(Number.isInteger(pageId) ? pageId : _pageId, true);
+    };
+
     window.getConfig = function() {
         return Promise.resolve(JSON.stringify(_config));
     };
 
     initPlayground();
+    setInterval(function() {
+        snapshotConfig(_pageId, false);
+    }, 750);
 
     if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {
         new QWebChannel(qt.webChannelTransport, function(channel) {
