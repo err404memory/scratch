@@ -92,6 +92,7 @@ def test_livecodes_pane_exposes_scratch_bridge_contract():
     assert "function isValidContentConfig(config)" in livecodes_html
     assert "function callApiWithResponse(method, args)" in livecodes_html
     assert "function snapshotConfig(pageId, force)" in livecodes_html
+    assert "callApi('watch', ['code'])" in livecodes_html
     assert "Scratch autosave ignored invalid config" in livecodes_html
     assert "Scratch autosave ignored empty update over non-empty note." in livecodes_html
     assert "Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete, allowEmpty: false }))" in livecodes_html
@@ -149,6 +150,10 @@ def test_scratch_ui_exposes_low_friction_commands():
     assert "def _run_livecodes_action(self, method, args=None):" in scratch_source
     assert "def _run_livecodes_edit_action(self, command):" in scratch_source
     assert "def capture_current_content(self):" in scratch_source
+    assert "def _flush_after_content_snapshot(self, callback=None, delay_ms=180):" in scratch_source
+    assert "self._flush_after_content_snapshot(self._quit_after_snapshot)" in scratch_source
+    assert "self._flush_after_content_snapshot(self._hide_after_snapshot)" in scratch_source
+    assert "def _hide_after_snapshot(self):" in scratch_source
     assert "scratchPageId" in scratch_source
     assert "is_livecodes_content_config" in scratch_source
     assert "Ignored empty LiveCodes save over non-empty page" in scratch_source

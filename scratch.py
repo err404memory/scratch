@@ -1227,6 +1227,13 @@ class ScratchPad(QWidget):
         self._capture_active_content()
         QTimer.singleShot(delay_ms, callback)
 
+    def _flush_after_content_snapshot(self, callback=None, delay_ms=180):
+        def finish():
+            self._flush_save()
+            if callback:
+                callback()
+        self._after_content_snapshot(finish, delay_ms=delay_ms)
+
     def _split_pane(self):
         if len(self._panes) >= 3:
             return
@@ -1756,7 +1763,9 @@ class ScratchPad(QWidget):
         QMessageBox.information(self, "Share", f"Ran share command: {command[0]}")
 
     def _quit(self):
-        self._flush_save()
+        self._flush_after_content_snapshot(self._quit_after_snapshot)
+
+    def _quit_after_snapshot(self):
         self.global_pty.stop()
         for pane in self._panes:
             pane.view.page().deleteLater()
@@ -1810,7 +1819,9 @@ class ScratchPad(QWidget):
         QTimer.singleShot(50, self.activateWindow)
 
     def hide(self):
-        self._flush_save()
+        self._flush_after_content_snapshot(self._hide_after_snapshot)
+
+    def _hide_after_snapshot(self):
         super().hide()
 
     def moveEvent(self, event):
@@ -1824,7 +1835,6 @@ class ScratchPad(QWidget):
 
     def closeEvent(self, event):
         if self._ui_settings["hide_on_close"]:
-            self._flush_save()
             self.global_pty.stop()
             event.ignore()
             self.hide()

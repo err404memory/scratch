@@ -205,6 +205,7 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
                 _pendingConfig = null;
             }
             callApi('show', [_editMode ? 'editor' : 'result']);
+            callApi('watch', ['code']);
             if (window.Bridge) Bridge.ready();
             return;
         }
