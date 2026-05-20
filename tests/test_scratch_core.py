@@ -252,6 +252,14 @@ def test_livecodes_config_clears_absent_tabs_between_notes():
     assert html_cfg["script"]["content"] == ""
 
 
+def test_livecodes_config_validation_requires_content_panel():
+    assert scratch_core.is_livecodes_content_config({"markup": {"content": ""}})
+    assert scratch_core.is_livecodes_content_config({"style": {"content": "body {}"}})
+    assert not scratch_core.is_livecodes_content_config({})
+    assert not scratch_core.is_livecodes_content_config({"markup": {"language": "markdown"}})
+    assert not scratch_core.is_livecodes_content_config({"markup": {"content": None}})
+
+
 def test_livecodes_config_splits_fenced_blocks():
     source = """```html
 <h1>Hello</h1>

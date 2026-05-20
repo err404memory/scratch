@@ -89,12 +89,15 @@ def test_livecodes_pane_exposes_scratch_bridge_contract():
     assert "livecodes-change" in livecodes_html
     assert "scratch-open-context-menu" in livecodes_html
     assert "function completeConfig(config)" in livecodes_html
+    assert "function isValidContentConfig(config)" in livecodes_html
     assert "function callApiWithResponse(method, args)" in livecodes_html
     assert "function snapshotConfig(pageId, force)" in livecodes_html
-    assert "Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete }))" in livecodes_html
+    assert "Scratch autosave ignored invalid config" in livecodes_html
+    assert "Scratch autosave ignored empty update over non-empty note." in livecodes_html
+    assert "Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete, allowEmpty: false }))" in livecodes_html
     assert "window.captureLiveCodesConfig" in livecodes_html
-    assert "setInterval(function()" in livecodes_html
-    assert "style: { language: style.language || 'css', content: style.content || '' }" in livecodes_html
+    assert "setInterval(function()" not in livecodes_html
+    assert "content: typeof style.content === 'string' ? style.content : ''" in livecodes_html
     assert "callApi('setConfig'" in livecodes_html
     assert "window.callLiveCodesApi" in livecodes_html
     assert "window.callLiveCodesEditCommand" in livecodes_html
@@ -102,7 +105,7 @@ def test_livecodes_pane_exposes_scratch_bridge_contract():
     assert "window.loadNoteSource" in livecodes_html
     assert "window.getSharePayload" in livecodes_html
     assert "window.focusEditor" in livecodes_html
-    assert "Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete }))" in livecodes_html
+    assert "Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete, allowEmpty: false }))" in livecodes_html
 
 
 def test_scratch_ui_exposes_low_friction_commands():
@@ -147,6 +150,12 @@ def test_scratch_ui_exposes_low_friction_commands():
     assert "def _run_livecodes_edit_action(self, command):" in scratch_source
     assert "def capture_current_content(self):" in scratch_source
     assert "scratchPageId" in scratch_source
+    assert "is_livecodes_content_config" in scratch_source
+    assert "Ignored empty LiveCodes save over non-empty page" in scratch_source
+    assert "BACKUP_DIR" in scratch_source
+    assert "MAX_NOTE_BACKUPS" in scratch_source
+    assert "def _backup_notes_file(self, next_payload):" in scratch_source
+    assert "os.replace(temp_file, DATA_FILE)" in scratch_source
     assert "def _after_content_snapshot(self, callback, delay_ms=140):" in scratch_source
     assert "font-size: 16px" in scratch_source
     assert "DEFAULT_UI_SETTINGS" in scratch_source

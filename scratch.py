@@ -15,6 +15,7 @@ import sys
 import termios
 import tempfile
 import threading
+import time
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -35,6 +36,7 @@ from scratch_core import (
     SHORTCUTS,
     Rect,
     create_shortcuts,
+    is_livecodes_content_config,
     livecodes_config_from_source,
     livecodes_source_from_config,
     livecodes_url,
@@ -50,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 DATA_FILE    = Path.home() / ".scratch-notes" / "notes.json"
 CONFIG_FILE  = Path.home() / ".scratch-notes" / "config.json"
+BACKUP_DIR   = DATA_FILE.parent / "backups"
+MAX_NOTE_BACKUPS = 100
 ASSETS_DIR   = Path(__file__).parent / "assets"
 EDITOR_URL   = QUrl.fromLocalFile(str(ASSETS_DIR / "editor.html"))
 LIVECODES_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "livecodes_pane.html"))
@@ -391,15 +395,28 @@ class QuillPane(QWidget):
 
     def on_content_changed(self, content):
         target_page = self._page_index
+        allow_empty = False
         try:
             payload = json.loads(content)
             if isinstance(payload, dict) and "config" in payload:
                 target_page = int(payload.get("scratchPageId", target_page))
+                allow_empty = bool(payload.get("allowEmpty"))
                 payload = payload.get("config", {})
-            source = livecodes_source_from_config(payload)
+                if not is_livecodes_content_config(payload):
+                    logger.warning("Ignored invalid LiveCodes save payload for page %s", target_page + 1)
+                    return
+                source = livecodes_source_from_config(payload)
+            elif is_livecodes_content_config(payload):
+                source = livecodes_source_from_config(payload)
+            else:
+                source = content
         except Exception:
             source = content
         if target_page < 0 or target_page >= len(self._pad.notes["pages"]):
+            return
+        current_source = self._pad.notes["pages"][target_page]
+        if source == "" and current_source.strip() and not allow_empty:
+            logger.warning("Ignored empty LiveCodes save over non-empty page %s", target_page + 1)
             return
         self._pad.notes["pages"][target_page] = source
         self._pad.schedule_save()
@@ -924,6 +941,33 @@ class ScratchPad(QWidget):
     def schedule_save(self):
         self._save_timer.start(400)
 
+    def _backup_notes_file(self, next_payload):
+        if not DATA_FILE.exists():
+            return
+        try:
+            current_payload = DATA_FILE.read_text()
+        except OSError as e:
+            logger.warning("Failed to read notes file before backup: %s", e)
+            return
+        if not current_payload.strip() or current_payload == next_payload:
+            return
+        try:
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            millis = int((time.time() % 1) * 1000)
+            backup_path = BACKUP_DIR / f"notes-{timestamp}-{millis:03d}.json"
+            backup_path.write_text(current_payload)
+            backup_path.chmod(0o600)
+            backups = sorted(
+                BACKUP_DIR.glob("notes-*.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for old_backup in backups[MAX_NOTE_BACKUPS:]:
+                old_backup.unlink()
+        except OSError as e:
+            logger.warning("Failed to create Scratch notes backup: %s", e)
+
     def _flush_save(self):
         current_geometry = (self.x(), self.y(), self.width(), self.height())
         self._init_geometry = current_geometry
@@ -937,7 +981,12 @@ class ScratchPad(QWidget):
             "active_page": self._active_pane().page_index,
         }
         DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-        DATA_FILE.write_text(json.dumps(self.notes, indent=2, ensure_ascii=False))
+        payload = json.dumps(self.notes, indent=2, ensure_ascii=False)
+        self._backup_notes_file(payload)
+        temp_file = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
+        temp_file.write_text(payload)
+        temp_file.chmod(0o600)
+        os.replace(temp_file, DATA_FILE)
         DATA_FILE.chmod(0o600)
 
     # ── window ───────────────────────────────────────────────────────────────

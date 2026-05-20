@@ -369,6 +369,17 @@ def _complete_livecodes_config(config: dict[str, Any]) -> dict[str, Any]:
     return complete
 
 
+def is_livecodes_content_config(config: dict[str, Any]) -> bool:
+    """Return True only for LiveCodes configs carrying editor panel content."""
+    if not isinstance(config, dict):
+        return False
+    for panel_name in ("markup", "style", "script"):
+        panel = config.get(panel_name)
+        if isinstance(panel, dict) and isinstance(panel.get("content"), str):
+            return True
+    return False
+
+
 def livecodes_config_from_source(source: str) -> dict[str, Any]:
     """Build a LiveCodes config from a single Scratch note string."""
     source = source or ""

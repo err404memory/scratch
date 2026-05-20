@@ -100,10 +100,27 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         const script = cfg.script || {};
         return {
             ...cfg,
-            markup: { language: markup.language || 'markdown', content: markup.content || '' },
-            style: { language: style.language || 'css', content: style.content || '' },
-            script: { language: script.language || 'javascript', content: script.content || '' },
+            markup: {
+                language: typeof markup.language === 'string' && markup.language ? markup.language : 'markdown',
+                content: typeof markup.content === 'string' ? markup.content : '',
+            },
+            style: {
+                language: typeof style.language === 'string' && style.language ? style.language : 'css',
+                content: typeof style.content === 'string' ? style.content : '',
+            },
+            script: {
+                language: typeof script.language === 'string' && script.language ? script.language : 'javascript',
+                content: typeof script.content === 'string' ? script.content : '',
+            },
         };
+    }
+
+    function isValidContentConfig(config) {
+        if (!config || typeof config !== 'object') return false;
+        return ['markup', 'style', 'script'].some(function(panelName) {
+            const panel = config[panelName];
+            return panel && typeof panel === 'object' && typeof panel.content === 'string';
+        });
     }
 
     function applyConfig(config) {
@@ -119,15 +136,25 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
     }
 
     function emitContentChanged(config, pageId, force) {
+        if (!isValidContentConfig(config)) {
+            console.warn('Scratch autosave ignored invalid config:', config);
+            return false;
+        }
         const complete = completeConfig(config);
+        const source = sourceFromConfig(complete);
+        if (!force && source === '' && _sourceText.trim()) {
+            console.warn('Scratch autosave ignored empty update over non-empty note.');
+            return false;
+        }
         const serialized = JSON.stringify(complete);
         _config = complete;
-        _sourceText = sourceFromConfig(complete);
-        if (!force && serialized === _lastEmittedConfigJson) return;
+        _sourceText = source;
+        if (!force && serialized === _lastEmittedConfigJson) return false;
         _lastEmittedConfigJson = serialized;
         if (window.Bridge) {
-            Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete }));
+            Bridge.contentChanged(JSON.stringify({ scratchPageId: pageId, config: complete, allowEmpty: false }));
         }
+        return true;
     }
 
     function snapshotConfig(pageId, force) {
@@ -135,8 +162,7 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
         const targetPage = Number.isInteger(pageId) ? pageId : _pageId;
         return callApiWithResponse('getConfig', [true])
             .then(function(config) {
-                emitContentChanged(config, targetPage, Boolean(force));
-                return true;
+                return emitContentChanged(config, targetPage, Boolean(force));
             })
             .catch(function(err) {
                 console.warn('Scratch autosave snapshot failed:', err);
@@ -243,9 +269,6 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
     };
 
     initPlayground();
-    setInterval(function() {
-        snapshotConfig(_pageId, false);
-    }, 750);
 
     if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {
         new QWebChannel(qt.webChannelTransport, function(channel) {
