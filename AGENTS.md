@@ -2,15 +2,12 @@
 
 ## Project Structure & Module Organization
 
-This repository contains the Scratch sticky-note app. `scratch.py` is the PyQt6/WebEngine application entrypoint and UI shell. `scratch_core.py` holds pure-Python helpers for note loading, rendering, shortcuts, LiveCodes config, Ollama payloads, and resize math. Browser-side assets live in `assets/`, including Quill, xterm.js, editor HTML, terminal HTML, and CSS. Tests live in `tests/`; `test_scratch_core.py` covers pure helpers and `test_ui_behavior.py` covers UI-adjacent behavior with display-dependent skips. `workflow/` contains local Agent Orchestrator workspace helpers. `telegram-notifier/` is a separate TypeScript AO notifier package.
+This repository contains the Scratch sticky-note app. `scratch.py` is the PyQt6/WebEngine application entrypoint and UI shell. `scratch_core.py` holds pure-Python helpers for note loading, rendering, shortcuts, LiveCodes config, Ollama payloads, and resize math. Browser-side assets live in `assets/`, including Quill, xterm.js, editor HTML, terminal HTML, and CSS. Tests live in `tests/`; `test_scratch_core.py` covers pure helpers and `test_ui_behavior.py` covers UI-adjacent behavior with display-dependent skips.
 
 ## Build, Test, and Development Commands
 
 - `/usr/bin/pytest tests/ -q`: run the reliable Scratch test suite from the repo root.
 - `python3.13 scratch.py`: launch the desktop sticky-note app when PyQt6 WebEngine is available.
-- `cd telegram-notifier && npm run typecheck`: validate the notifier TypeScript without emitting files.
-- `cd telegram-notifier && npm run build`: compile notifier output into `telegram-notifier/dist/`.
-- `bash workflow/ao-workspace.sh`: start the local AO/zellij workflow if those tools are installed.
 
 ## Coding Style & Naming Conventions
 
@@ -26,4 +23,4 @@ The current history uses short, lower-case commit summaries such as `initial com
 
 ## Agent-Specific Instructions
 
-Keep Scratch preview-first: the note surface should remain readable by default, with Quill editing exposed only through the edit flow. Do not commit local notes data from `~/.scratch-notes/`. Never add bot tokens, chat IDs, or other secrets to the repo; configure notifier credentials through environment variables.
+Keep Scratch preview-first: the note surface should remain readable by default, with Quill editing exposed only through the edit flow. Do not commit local notes data from `~/.scratch-notes/`. Never add bot tokens, chat IDs, or other secrets to the repo.

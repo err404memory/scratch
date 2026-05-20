@@ -40,13 +40,6 @@ python3.13 -m py_compile scratch.py scratch_core.py
 python3.13 scratch.py
 ```
 
-Notifier package checks:
-
-```bash
-cd telegram-notifier && npm run typecheck
-cd telegram-notifier && npm run build
-```
-
 ## Recovery Notes
 
 If note content disappears, stop using the app immediately and inspect:
