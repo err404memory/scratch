@@ -262,7 +262,13 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
     };
 
     window.captureLiveCodesConfig = function(pageId) {
-        return snapshotConfig(Number.isInteger(pageId) ? pageId : _pageId, true);
+        var promise = snapshotConfig(Number.isInteger(pageId) ? pageId : _pageId, true);
+        promise.then(function() {
+            if (window.Bridge) Bridge.snapshotDone();
+        }, function() {
+            if (window.Bridge) Bridge.snapshotDone();
+        });
+        return promise;
     };
 
     window.getConfig = function() {

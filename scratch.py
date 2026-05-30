@@ -23,7 +23,7 @@ from pathlib import Path
 from PyQt6.QtCore import QEvent, QObject, QPoint, QSize, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QCursor, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -306,6 +306,10 @@ class QuillBridge(QObject):
         QTimer.singleShot(80, lambda: self._pane.view.page().runJavaScript("focusEditor()"))
 
     @pyqtSlot()
+    def snapshotDone(self):
+        self._pane._on_snapshot_done()
+
+    @pyqtSlot()
     def openContextMenu(self):
         self._pane._pad._open_context_menu_at(QCursor.pos())
 
@@ -354,6 +358,11 @@ class QuillPane(QWidget):
         self._editor_ready = False
         self._pending_html = None
         self._edit_mode    = False
+
+        self._snapshot_callback = None
+        self._snapshot_fallback = QTimer(self)
+        self._snapshot_fallback.setSingleShot(True)
+        self._snapshot_fallback.timeout.connect(self._on_snapshot_done)
 
         self.bridge  = QuillBridge(self)
         self.channel = QWebChannel(self)
@@ -430,6 +439,22 @@ class QuillPane(QWidget):
     def capture_current_content(self):
         if self._editor_ready:
             self.view.page().runJavaScript(f"captureLiveCodesConfig({self._page_index})")
+
+    def capture_and_then(self, callback, fallback_ms=500):
+        """Capture editor content, then invoke callback once JS confirms done (or timeout)."""
+        self._snapshot_callback = callback
+        self._snapshot_fallback.start(fallback_ms)
+        if self._editor_ready:
+            self.view.page().runJavaScript(f"captureLiveCodesConfig({self._page_index})")
+        else:
+            self._on_snapshot_done()
+
+    def _on_snapshot_done(self):
+        self._snapshot_fallback.stop()
+        cb = self._snapshot_callback
+        self._snapshot_callback = None
+        if cb:
+            cb()
 
     def get_share_payload(self, callback):
         self.view.page().runJavaScript("getSharePayload()", callback)
@@ -1218,21 +1243,15 @@ class ScratchPad(QWidget):
                 pane._send_content(html)
         self._update_nav()
 
-    def _capture_active_content(self):
-        pane = self._active_pane()
-        if pane and pane._editor_ready:
-            pane.capture_current_content()
+    def _after_content_snapshot(self, callback):
+        self._active_pane().capture_and_then(callback)
 
-    def _after_content_snapshot(self, callback, delay_ms=140):
-        self._capture_active_content()
-        QTimer.singleShot(delay_ms, callback)
-
-    def _flush_after_content_snapshot(self, callback=None, delay_ms=180):
+    def _flush_after_content_snapshot(self, callback=None):
         def finish():
             self._flush_save()
             if callback:
                 callback()
-        self._after_content_snapshot(finish, delay_ms=delay_ms)
+        self._active_pane().capture_and_then(finish)
 
     def _split_pane(self):
         if len(self._panes) >= 3:
@@ -1338,6 +1357,26 @@ class ScratchPad(QWidget):
         self._flush_save()
         self.notes["pages"].insert(idx + 1, "")
         self._active_pane().load_page(idx + 1)
+        self._flush_save()
+        self._update_nav()
+
+    def _remove_blank_pages(self):
+        non_blank = [p for p in self.notes["pages"] if str(p).strip()]
+        removed = len(self.notes["pages"]) - len(non_blank)
+        if removed == 0:
+            QMessageBox.information(self, "Clean up", "No blank pages found.")
+            return
+        reply = QMessageBox.question(
+            self, "Remove blank pages",
+            f"Remove {removed} blank page{'s' if removed != 1 else ''}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.notes["pages"] = non_blank or [""]
+        new_max = len(self.notes["pages"]) - 1
+        for pane in self._panes:
+            pane.load_page(min(pane.page_index, new_max))
         self._flush_save()
         self._update_nav()
 
@@ -1461,25 +1500,29 @@ class ScratchPad(QWidget):
             method="POST",
         )
 
-        self._new_page()
-        response_idx = self._active_pane().page_index
-        self.notes["pages"][response_idx] = ""
-        self._active_pane().load_page(response_idx)
-        self._update_nav()
+        def _after_snapshot():
+            self._flush_save()
+            response_idx = self._active_pane().page_index + 1
+            self.notes["pages"].insert(response_idx, "")
+            self._active_pane().load_page(response_idx)
+            self._flush_save()
+            self._update_nav()
 
-        def _stream():
-            chunks = []
-            try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    for chunk in ollama_stream_chunks(resp):
-                        chunks.append(chunk)
-                        self._ollama_chunk.emit(response_idx, chunk)
-                response_text = "".join(chunks)
-            except Exception as e:
-                response_text = f"Error: {e}"
-            self._ollama_done.emit(response_idx, response_text)
+            def _stream():
+                chunks = []
+                try:
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        for chunk in ollama_stream_chunks(resp):
+                            chunks.append(chunk)
+                            self._ollama_chunk.emit(response_idx, chunk)
+                    response_text = "".join(chunks)
+                except Exception as e:
+                    response_text = f"Error: {e}"
+                self._ollama_done.emit(response_idx, response_text)
 
-        threading.Thread(target=_stream, daemon=True).start()
+            threading.Thread(target=_stream, daemon=True).start()
+
+        self._after_content_snapshot(_after_snapshot)
 
     def _on_ollama_chunk(self, page_index, chunk):
         self.notes["pages"][page_index] += chunk
@@ -1559,6 +1602,7 @@ class ScratchPad(QWidget):
         pin_act = add_action("Toggle pin", "Ctrl+P")
         menu.addSeparator()
         delete_act = add_action("Delete page", "Ctrl+W")
+        remove_blanks_act = add_action("Remove all blank pages")
         hide_act = add_action("Hide to tray", "Ctrl+H")
         quit_act = add_action("Quit", "Ctrl+Q")
 
@@ -1571,6 +1615,7 @@ class ScratchPad(QWidget):
             export_act: self._export_page,
             pin_act: self._toggle_pin,
             delete_act: self._delete_page,
+            remove_blanks_act: self._remove_blank_pages,
             hide_act: self.hide,
             quit_act: self._quit,
             lc_editor_act: lambda: self._run_livecodes_action("show", ["editor"]),
@@ -1605,8 +1650,18 @@ class ScratchPad(QWidget):
 
     def _run_livecodes_edit_action(self, command):
         pane = self._active_pane()
-        if pane and pane._editor_ready:
-            pane.run_livecodes_edit_command(command)
+        if not pane or not pane._editor_ready:
+            return
+        action_map = {
+            "cut": QWebEnginePage.WebAction.Cut,
+            "copy": QWebEnginePage.WebAction.Copy,
+            "paste": QWebEnginePage.WebAction.Paste,
+            "selectAll": QWebEnginePage.WebAction.SelectAll,
+        }
+        web_action = action_map.get(command)
+        if web_action is not None:
+            page = pane.view.page()
+            QTimer.singleShot(0, lambda: page.triggerAction(web_action))
 
     def _open_config_panel(self):
         dialog = ConfigDialog(self, self.config)
