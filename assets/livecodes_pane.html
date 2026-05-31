@@ -231,8 +231,10 @@ html, body { height: 100%; background: #0d1117; overflow: hidden; }
     };
 
     window.setPreviewHtml = function(html) {
+        _editMode = false;
         _sourceText = html || '';
         window.loadConfig(JSON.stringify({ markup: { language: 'html', content: html || '' } }));
+        if (_ready) callApi('show', ['result']);
     };
 
     window.focusEditor = function() {

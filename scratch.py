@@ -27,21 +27,32 @@ from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineSe
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMenu, QMessageBox, QPushButton, QSizePolicy, QSpacerItem, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMenu, QMessageBox, QPushButton, QRadioButton, QScrollArea,
+    QSizePolicy, QSpacerItem, QSpinBox, QSplitter,
+    QStackedWidget, QSystemTrayIcon, QTabWidget,
     QTextEdit, QVBoxLayout, QWidget, QInputDialog,
 )
 
 from scratch_core import (
+    OLLAMA_PARAM_GROUPS,
     SHORTCUTS,
     Rect,
+    chat_page_html,
     create_shortcuts,
+    is_chat_page_html,
     is_livecodes_content_config,
     livecodes_config_from_source,
     livecodes_source_from_config,
     livecodes_url,
+    migrate_ollama_config,
+    ollama_chat_payload,
+    ollama_chat_stream_chunks,
     ollama_generate_payload,
     ollama_stream_chunks,
+    parse_chat_page_html,
+    parse_ollama_model_params,
     plain_text_from_html,
     preformatted_html,
     resize_rect,
@@ -49,6 +60,18 @@ from scratch_core import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_injection_content(inj: dict) -> str:
+    """Read content for a context injection item (file or inline text)."""
+    if inj.get("type") == "file":
+        try:
+            return Path(inj["path"]).expanduser().read_text(errors="replace")
+        except Exception as e:
+            logger.warning("Injection file unreadable %s: %s", inj.get("path"), e)
+            return ""
+    return inj.get("content", "")
+
 
 DATA_FILE    = Path.home() / ".scratch-notes" / "notes.json"
 CONFIG_FILE  = Path.home() / ".scratch-notes" / "config.json"
@@ -351,6 +374,10 @@ class QuillPane(QWidget):
     """Container pane hosting the LiveCodes-backed editor/preview."""
     content_changed = pyqtSignal(int, str)
 
+    chat_message_sent     = pyqtSignal(int, str)  # page_index, text
+    page_loaded           = pyqtSignal(int)        # page_index
+    restore_history_requested = pyqtSignal(int)    # page_index
+
     def __init__(self, pad, initial_page=0):
         super().__init__()
         self._pad          = pad
@@ -380,9 +407,43 @@ class QuillPane(QWidget):
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.view.installEventFilter(self)
 
+        # Dedicated chat view — bypasses LiveCodes entirely for AI responses
+        self._chat_view = QWebEngineView(self)
+        self._chat_view.setMinimumSize(QSize(0, 0))
+        self._chat_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self._chat_view_ready = False
+        self._chat_view_initializing = False
+        self._pending_chat_body: str | None = None
+        self._chat_view.loadFinished.connect(self._on_chat_view_ready)
+
+        self._view_stack = QStackedWidget(self)
+        self._view_stack.addWidget(self.view)       # index 0 — LiveCodes
+        self._view_stack.addWidget(self._chat_view) # index 1 — AI chat
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.view)
+        layout.addWidget(self._view_stack, 1)
+
+        self._chat_bar = QWidget(self)
+        chat_hl = QHBoxLayout(self._chat_bar)
+        chat_hl.setContentsMargins(6, 4, 6, 6)
+        chat_hl.setSpacing(6)
+        self._chat_input = QTextEdit(self._chat_bar)
+        self._chat_input.setMaximumHeight(58)
+        self._chat_input.setPlaceholderText("Reply to Ollama… (Enter to send, Shift+Enter for newline)")
+        self._chat_input.installEventFilter(self)
+        self._send_btn = QPushButton("Send", self._chat_bar)
+        self._send_btn.setFixedWidth(56)
+        self._send_btn.clicked.connect(self._on_chat_send)
+        self._restore_btn = QPushButton("Restore history", self._chat_bar)
+        self._restore_btn.clicked.connect(
+            lambda: self.restore_history_requested.emit(self._page_index))
+        self._restore_btn.hide()
+        chat_hl.addWidget(self._restore_btn)
+        chat_hl.addWidget(self._chat_input, 1)
+        chat_hl.addWidget(self._send_btn)
+        self._chat_bar.hide()
+        layout.addWidget(self._chat_bar)
 
     @property
     def page_index(self):
@@ -395,6 +456,7 @@ class QuillPane(QWidget):
             self._send_content(html)
         else:
             self._pending_html = html
+        self.page_loaded.emit(index)
 
     def on_editor_ready(self):
         self._editor_ready = True
@@ -492,7 +554,64 @@ class QuillPane(QWidget):
         )
         self.view.page().scripts().insert(script)
 
+    def set_chat_mode(self, enabled: bool, *, restore_available: bool = False):
+        if enabled:
+            self._chat_bar.show()
+            self._view_stack.setCurrentIndex(1)
+            self._chat_input.setEnabled(not restore_available)
+            self._send_btn.setEnabled(not restore_available)
+            self._restore_btn.setVisible(restore_available)
+        else:
+            self._chat_bar.hide()
+            self._view_stack.setCurrentIndex(0)
+            self.set_edit_mode(True)  # reset editor view when leaving chat
+
+    def set_history_restored(self):
+        """Called after chat history has been restored; re-enables the reply bar."""
+        self._restore_btn.hide()
+        self._chat_input.setEnabled(True)
+        self._send_btn.setEnabled(True)
+
+    def _on_chat_view_ready(self, ok: bool):
+        self._chat_view_ready = True
+        self._chat_view_initializing = False
+        if self._pending_chat_body is not None:
+            body = self._pending_chat_body
+            self._pending_chat_body = None
+            self._update_chat_body(body)
+
+    def _update_chat_body(self, html_fragment: str):
+        self._chat_view.page().runJavaScript(
+            "document.body.innerHTML = " + json.dumps(html_fragment) + ";"
+            "window.scrollTo(0, document.body.scrollHeight);"
+        )
+
+    def show_chat_html(self, html_fragment: str):
+        """Render chat content in the dedicated chat view and switch to it."""
+        self._view_stack.setCurrentIndex(1)
+        if not self._chat_view_ready:
+            self._pending_chat_body = html_fragment
+            if not self._chat_view_initializing:
+                self._chat_view_initializing = True
+                self._chat_view.setHtml(
+                    "<!DOCTYPE html><html><head><meta charset='UTF-8'></head>"
+                    "<body style='margin:0;padding:0;'></body></html>"
+                )
+        else:
+            self._update_chat_body(html_fragment)
+
+    def _on_chat_send(self):
+        text = self._chat_input.toPlainText().strip()
+        if text:
+            self._chat_input.clear()
+            self.chat_message_sent.emit(self._page_index, text)
+
     def eventFilter(self, obj, event):
+        if obj is self._chat_input and event.type() == QEvent.Type.KeyPress:
+            if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                    and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+                self._on_chat_send()
+                return True
         if obj is self.view and event.type() == QEvent.Type.MouseButtonPress:
             self.window().activateWindow()
             self.window().raise_()
@@ -604,6 +723,717 @@ class ResizeGrip(ResizeHandle):
         self.setToolTip("Resize window")
 
 
+class OllamaPromptDialog(QDialog):
+    """Prompt dialog for asking Ollama about the current note."""
+
+    def __init__(self, parent, profiles: list | None = None, active_profile: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Ask Ollama")
+        self.resize(500, 220)
+        root = QVBoxLayout(self)
+        profiles = profiles or []
+        self._profile_combo: QComboBox | None = None
+        if len(profiles) > 1:
+            prof_row = QHBoxLayout()
+            prof_row.addWidget(QLabel("Profile:"))
+            self._profile_combo = QComboBox()
+            for p in profiles:
+                self._profile_combo.addItem(p.get("name", "?"))
+            if active_profile:
+                self._profile_combo.setCurrentText(active_profile)
+            prof_row.addWidget(self._profile_combo, 1)
+            root.addLayout(prof_row)
+        root.addWidget(QLabel("What would you like to ask about this note?"))
+        self.text = QTextEdit(self)
+        self.text.setMinimumHeight(110)
+        self.text.setPlaceholderText(
+            "e.g. Summarize this, fix the bugs, explain this code, translate to Spanish…"
+        )
+        root.addWidget(self.text, 1)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def value(self) -> str:
+        return self.text.toPlainText().strip()
+
+    def selected_profile(self) -> str | None:
+        return self._profile_combo.currentText() if self._profile_combo else None
+
+
+class InjectionEditDialog(QDialog):
+    """Add or edit a single context injection entry."""
+
+    def __init__(self, parent, item=None):
+        super().__init__(parent)
+        item = item or {}
+        self.setWindowTitle("Edit injection" if item else "Add injection")
+        self.resize(480, 320)
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        root.addLayout(form)
+
+        self._label = QLineEdit(item.get("label", ""))
+        self._label.setPlaceholderText("Short name shown in the list")
+        form.addRow("Label", self._label)
+
+        type_row = QWidget()
+        type_hl = QHBoxLayout(type_row)
+        type_hl.setContentsMargins(0, 0, 0, 0)
+        self._rb_file = QRadioButton("File")
+        self._rb_text = QRadioButton("Inline text")
+        type_hl.addWidget(self._rb_file)
+        type_hl.addWidget(self._rb_text)
+        type_hl.addStretch()
+        form.addRow("Type", type_row)
+
+        path_row = QWidget()
+        path_hl = QHBoxLayout(path_row)
+        path_hl.setContentsMargins(0, 0, 0, 0)
+        self._path = QLineEdit(item.get("path", ""))
+        self._path.setPlaceholderText("Absolute path to file")
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setFixedWidth(72)
+        browse_btn.clicked.connect(self._browse)
+        path_hl.addWidget(self._path, 1)
+        path_hl.addWidget(browse_btn)
+        self._path_row_w = path_row
+        form.addRow("Path", path_row)
+
+        self._text_content = QTextEdit(item.get("content", ""))
+        self._text_content.setMinimumHeight(80)
+        self._text_content.setPlaceholderText("Paste text to inject directly…")
+        self._text_row_label = QLabel("Content")
+        form.addRow(self._text_row_label, self._text_content)
+
+        role_row = QWidget()
+        role_hl = QHBoxLayout(role_row)
+        role_hl.setContentsMargins(0, 0, 0, 0)
+        self._rb_system = QRadioButton("System")
+        self._rb_user = QRadioButton("User context")
+        role_hl.addWidget(self._rb_system)
+        role_hl.addWidget(self._rb_user)
+        role_hl.addStretch()
+        form.addRow("Inject as", role_row)
+
+        help_lbl = QLabel(
+            "System: appended to the system prompt (invisible to user turn).\n"
+            "User context: added as an acknowledged context exchange before your prompt."
+        )
+        help_lbl.setWordWrap(True)
+        help_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        root.addWidget(help_lbl)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        (self._rb_file if item.get("type", "file") == "file" else self._rb_text).setChecked(True)
+        (self._rb_system if item.get("role", "system") == "system" else self._rb_user).setChecked(True)
+        self._rb_file.toggled.connect(self._on_type_changed)
+        self._on_type_changed()
+
+    def _on_type_changed(self):
+        is_file = self._rb_file.isChecked()
+        self._path_row_w.setVisible(is_file)
+        self._text_content.setVisible(not is_file)
+        self._text_row_label.setVisible(not is_file)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select file to inject")
+        if path:
+            self._path.setText(path)
+            if not self._label.text():
+                self._label.setText(Path(path).name)
+
+    def value(self) -> dict:
+        typ = "file" if self._rb_file.isChecked() else "text"
+        d = {
+            "label": self._label.text().strip() or (self._path.text().split("/")[-1] if typ == "file" else "text"),
+            "type": typ,
+            "role": "system" if self._rb_system.isChecked() else "user",
+        }
+        if typ == "file":
+            d["path"] = self._path.text().strip()
+        else:
+            d["content"] = self._text_content.toPlainText()
+        return d
+
+
+_OLLAMA_PARAM_HELP: dict[str, str] = {
+    "temperature": (
+        "Controls how unpredictable the output is.\n\n"
+        "Low (0.1–0.3): Near-identical results each run. Best for code, factual Q&A, "
+        "structured output where consistency matters.\n\n"
+        "High (1.2–1.8): Word choices vary noticeably between runs — useful for creative "
+        "writing or brainstorming where you want variety.\n\n"
+        "Example: At 0.2, rewriting a sentence gives almost the same phrasing every time. "
+        "At 1.4, each run finds a different angle."
+    ),
+    "top_p": (
+        "Nucleus sampling: only tokens whose combined probability reaches this fraction "
+        "are candidates for the next word.\n\n"
+        "Low (0.5): Very focused pool — the model stays safe and on-topic.\n"
+        "High (0.95): Nearly the full vocabulary is on the table.\n\n"
+        "Example: A factual assistant at 0.7 stays grounded. "
+        "Creative brainstorming at 0.95 opens up unusual vocabulary. "
+        "Works alongside temperature — lowering one often makes the other less necessary."
+    ),
+    "top_k": (
+        "Hard cap on how many token candidates are considered at each step, "
+        "regardless of their probability.\n\n"
+        "Low (10–20): Only the most likely words are ever chosen — very predictable.\n"
+        "High (100–200): Wide vocabulary, more room for creative choices.\n"
+        "0: Disables the limit entirely.\n\n"
+        "Example: Coding tasks benefit from top_k 20–40. "
+        "Open-ended storytelling from 80–150."
+    ),
+    "min_p": (
+        "Filters out any token less probable than (min_p × probability of the top token). "
+        "Clips the tail of the distribution more precisely than top_k alone.\n\n"
+        "0.0: Disabled — no tokens filtered by this rule.\n"
+        "0.1: Drops any word less than 10% as likely as the best option.\n\n"
+        "Example: min_p=0.05 quietly removes weird tangential words without affecting "
+        "the most natural choices. Pairs well with a higher temperature."
+    ),
+    "repeat_penalty": (
+        "Divides the probability of tokens that appeared recently, "
+        "discouraging the model from looping.\n\n"
+        "1.0: No penalty — the model may repeat phrases freely.\n"
+        "1.1–1.2: Gentle nudge, fixes most looping without side effects.\n"
+        "1.5+: Aggressively avoids recent words, which can make common words "
+        "feel strangely absent.\n\n"
+        "Example: If the model keeps writing 'furthermore, furthermore' — "
+        "bumping from 1.0 to 1.15 usually cures it."
+    ),
+    "repeat_last_n": (
+        "How many tokens back the repeat penalty scans when deciding what to penalise.\n\n"
+        "-1: Scans the entire context — catches echoes from anywhere in the conversation.\n"
+        "64: Only looks at the last ~64 tokens (recent output).\n"
+        "0: Disables repeat penalty entirely.\n\n"
+        "Example: For a short answer, 64 is fine. For long-form writing where you want "
+        "to avoid re-using a word from three paragraphs ago, use -1."
+    ),
+    "presence_penalty": (
+        "Applies a flat penalty to any token that has appeared at all, "
+        "encouraging new topics and vocabulary regardless of frequency.\n\n"
+        "Positive (0.2–0.6): Pushes the model to introduce new ideas and vary phrasing.\n"
+        "Negative (−0.2 to −0.5): Allows the model to revisit the same words freely — "
+        "useful for structured output with repeated labels or chant-like formats.\n\n"
+        "Example: 0.3 noticeably diversifies a long response. "
+        "-0.3 is handy for markdown tables or bullet lists where repeated words are intentional."
+    ),
+    "frequency_penalty": (
+        "Like presence penalty, but scales with how many times a token has already appeared — "
+        "the more a word has been used, the harder it is penalised.\n\n"
+        "Positive (0.3–0.8): Increasingly strong pressure to avoid over-used words, "
+        "keeping long responses fresh.\n"
+        "Negative: Allows and even encourages high-frequency repetition.\n\n"
+        "Example: 0.5 on a long essay noticeably reduces filler phrases like "
+        "'it is important to note that'."
+    ),
+    "num_ctx": (
+        "The total token window the model can see at once, covering your system prompt, "
+        "injected context, conversation history, and the response.\n\n"
+        "Small (2048): Fast, lower VRAM, fine for short notes and quick questions.\n"
+        "Large (8192–32768): Needed for multi-turn conversations, large injected files, "
+        "or when the model seems to 'forget' something from earlier in the session.\n\n"
+        "Example: A single-note summary works fine at 2048. "
+        "A coding session where you paste a whole file needs at least 8192."
+    ),
+    "num_predict": (
+        "Maximum tokens the model will generate in a single response. "
+        "-1 means no limit — the model stops when it naturally finishes.\n\n"
+        "-1: Unlimited. Model decides when it's done.\n"
+        "256–512: Caps at roughly 2–3 short paragraphs. Good for quick answers.\n"
+        "If a response feels like it was cut off mid-sentence, "
+        "this limit (or num_ctx) was hit.\n\n"
+        "Example: Set 300 for a model that over-explains everything. "
+        "Leave at -1 when writing long documents."
+    ),
+    "seed": (
+        "A fixed integer seed makes the same prompt produce identical output every time. "
+        "-1 picks a new random seed on each run.\n\n"
+        "-1: Random — different result each run (default).\n"
+        "Any fixed integer: Fully reproducible output for that exact prompt + settings.\n\n"
+        "Example: You got a perfect response and want to regenerate it exactly — "
+        "note the seed Ollama logs (or set one yourself), paste it here. "
+        "Set back to -1 when you want variety again."
+    ),
+    "tfs_z": (
+        "Tail-free sampling removes tokens at the very bottom of the probability "
+        "distribution before sampling, reducing 'noise' tokens without affecting likely words.\n\n"
+        "1.0: Disabled.\n"
+        "0.95: Gently trims the tail — barely noticeable in output but removes "
+        "occasional odd word choices.\n"
+        "0.5: More aggressive, may start affecting fluency.\n\n"
+        "Example: Leave near 1.0 unless you're seeing random rare words pop up at "
+        "higher temperatures. Usually doesn't need adjusting."
+    ),
+    "typical_p": (
+        "Keeps tokens that are 'typically probable' given context — discarding both "
+        "the most obvious choices and long-shot surprises, to mimic natural writing patterns.\n\n"
+        "1.0: Disabled.\n"
+        "0.85: Reduces filler phrases and over-confident completions without sacrificing variety.\n"
+        "0.5: Tight, constrained — almost never surprises you.\n\n"
+        "Example: 0.85 can clean up a model that pads responses with "
+        "'It is worth noting that...' type filler."
+    ),
+    "mirostat": (
+        "A perplexity-targeting algorithm that dynamically adjusts sampling to maintain "
+        "consistent coherence across a response.\n\n"
+        "0: Off — use top_p/top_k/temperature instead.\n"
+        "1: Mirostat v1 (original).\n"
+        "2: Mirostat v2 — generally recommended, often outperforms manual top-p/top-k "
+        "for sustained long-form writing.\n\n"
+        "Example: With mirostat=2 a long story stays coherent and engaged throughout "
+        "instead of drifting into repetition. When active, set tau and eta; "
+        "top_k/top_p have less effect."
+    ),
+    "mirostat_tau": (
+        "Target entropy ('surprise level') when Mirostat is active. "
+        "Think of it as how adventurous the model is allowed to be.\n\n"
+        "Low (2–4): Focused, predictable output that stays on topic.\n"
+        "High (7–9): Varied, imaginative — the model takes more unexpected turns.\n\n"
+        "Example: tau=3.5 for an essay that must stay on-point. "
+        "tau=7.0 for a story you want to surprise you. "
+        "Default 5.0 is a reasonable middle ground for most tasks."
+    ),
+    "mirostat_eta": (
+        "Learning rate for Mirostat — how quickly it corrects when output drifts "
+        "away from the target tau.\n\n"
+        "Low (0.05–0.1): Gradual corrections, smooth output — recommended for most uses.\n"
+        "High (0.3–0.5): Reacts fast but can cause choppy swings between dull and chaotic "
+        "within a single response.\n\n"
+        "Example: Default 0.1 is right for almost everything. "
+        "Only increase if you need very tight real-time perplexity control."
+    ),
+}
+
+
+class _HelpPopup(QFrame):
+    """Small popup panel shown when a parameter help button is clicked."""
+
+    _STYLE = (
+        "QFrame {"
+        "  background: #1c2128;"
+        "  border: 1px solid #444c56;"
+        "  border-radius: 6px;"
+        "  padding: 2px;"
+        "}"
+        "QLabel { color: #cdd9e5; font-size: 12px; background: transparent; }"
+    )
+
+    def __init__(self, text: str):
+        super().__init__(None, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setStyleSheet(self._STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setMaximumWidth(320)
+        layout.addWidget(lbl)
+
+    def show_near(self, global_pos: QPoint):
+        self.adjustSize()
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = min(global_pos.x(), screen.right() - self.width() - 8)
+        y = global_pos.y() + 6
+        if y + self.height() > screen.bottom() - 8:
+            y = global_pos.y() - self.height() - 6
+        self.move(x, y)
+        self.show()
+
+
+class OllamaParamsDialog(QDialog):
+    """Advanced Ollama generation parameters and context injection editor."""
+
+    def __init__(self, parent, model_params: dict, injections: list,
+                 base_url: str = "http://localhost:11434", model: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Model parameters")
+        self.resize(500, 580)
+        self._model_params = dict(model_params)
+        self._injections = list(injections)
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+
+        root = QVBoxLayout(self)
+        tabs = QTabWidget()
+        root.addWidget(tabs, 1)
+
+        # ── Generation tab ────────────────────────────────────────────────────
+        gen_tab = QWidget()
+        gen_scroll = QScrollArea()
+        gen_scroll.setWidgetResizable(True)
+        gen_container = QWidget()
+        gen_vbox = QVBoxLayout(gen_container)
+        gen_vbox.setContentsMargins(8, 8, 8, 8)
+        gen_vbox.setSpacing(2)
+
+        self._param_rows: dict[str, tuple] = {}  # key → (checkbox, spinbox)
+        for section, params in OLLAMA_PARAM_GROUPS:
+            hdr = QLabel(section)
+            hdr.setStyleSheet("font-weight: bold; padding-top: 10px; padding-bottom: 2px;")
+            gen_vbox.addWidget(hdr)
+            form = QFormLayout()
+            form.setContentsMargins(0, 0, 0, 4)
+            form.setHorizontalSpacing(8)
+            gen_vbox.addLayout(form)
+            for key, label, typ, default, lo, hi, step, tip in params:
+                row_w = QWidget()
+                row_hl = QHBoxLayout(row_w)
+                row_hl.setContentsMargins(0, 0, 0, 0)
+                row_hl.setSpacing(6)
+                cb = QCheckBox()
+                cb.setToolTip("Check to override the model default")
+                if typ is float:
+                    sb = QDoubleSpinBox()
+                    sb.setRange(lo, hi)
+                    sb.setSingleStep(step)
+                    sb.setDecimals(3 if step < 0.01 else 2)
+                    sb.setValue(float(self._model_params.get(key, default)))
+                else:
+                    sb = QSpinBox()
+                    sb.setRange(lo, hi)
+                    sb.setSingleStep(step)
+                    sb.setValue(int(self._model_params.get(key, default)))
+                sb.setFixedWidth(120)
+                cb.setChecked(key in self._model_params)
+                sb.setEnabled(cb.isChecked())
+                cb.toggled.connect(sb.setEnabled)
+                help_btn = QPushButton("?")
+                help_btn.setFixedSize(17, 17)
+                help_btn.setFlat(True)
+                help_btn.setStyleSheet(
+                    "QPushButton { border: 1px solid #555; border-radius: 8px;"
+                    " color: #888; font-size: 10px; font-weight: bold; padding: 0; }"
+                    "QPushButton:hover { background: #333; color: #ccc; }"
+                )
+                help_text = _OLLAMA_PARAM_HELP.get(key, tip)
+                help_btn.clicked.connect(
+                    lambda _checked, btn=help_btn, txt=help_text: self._show_help(btn, txt)
+                )
+                row_hl.addWidget(cb)
+                row_hl.addWidget(sb)
+                row_hl.addStretch()
+                row_hl.addWidget(help_btn)
+                form.addRow(label, row_w)
+                self._param_rows[key] = (cb, sb)
+
+        gen_vbox.addStretch()
+        gen_scroll.setWidget(gen_container)
+        reset_btn = QPushButton("Reset all to model defaults")
+        reset_btn.clicked.connect(self._reset_all)
+        load_btn = QPushButton(f"Load from model{': ' + self._model if self._model else ''}…")
+        load_btn.setToolTip("Fetch the model's built-in recommended parameters from Ollama")
+        load_btn.clicked.connect(self._load_from_model)
+        gen_root = QVBoxLayout(gen_tab)
+        gen_root.setContentsMargins(0, 0, 0, 0)
+        gen_root.addWidget(gen_scroll, 1)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(load_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(reset_btn)
+        gen_root.addLayout(btn_row)
+        tabs.addTab(gen_tab, "Generation")
+
+        # ── Injection tab ─────────────────────────────────────────────────────
+        inj_tab = QWidget()
+        inj_root = QVBoxLayout(inj_tab)
+        inj_root.setContentsMargins(8, 8, 8, 8)
+
+        inj_help = QLabel(
+            "Inject files or text into every chat started from this profile.\n"
+            "Files are read fresh each time a new chat begins."
+        )
+        inj_help.setWordWrap(True)
+        inj_help.setStyleSheet("color: gray; font-size: 11px; padding-bottom: 6px;")
+        inj_root.addWidget(inj_help)
+
+        self._inj_list = QListWidget()
+        self._inj_list.itemDoubleClicked.connect(self._edit_injection)
+        inj_root.addWidget(self._inj_list, 1)
+        self._refresh_inj_list()
+
+        inj_btns = QHBoxLayout()
+        add_inj = QPushButton("Add…")
+        edit_inj = QPushButton("Edit…")
+        del_inj = QPushButton("Remove")
+        add_inj.clicked.connect(self._add_injection)
+        edit_inj.clicked.connect(self._edit_injection)
+        del_inj.clicked.connect(self._delete_injection)
+        inj_btns.addWidget(add_inj)
+        inj_btns.addWidget(edit_inj)
+        inj_btns.addWidget(del_inj)
+        inj_btns.addStretch()
+        inj_root.addLayout(inj_btns)
+        tabs.addTab(inj_tab, "Injection")
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def _load_from_model(self):
+        if not self._model:
+            QMessageBox.information(self, "Load from model", "No model selected.")
+            return
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(
+                f"{self._base_url}/api/show",
+                data=json.dumps({"name": self._model}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            params_str = data.get("parameters", "")
+        except Exception as e:
+            QMessageBox.warning(self, "Load from model", f"Could not fetch model info:\n{e}")
+            return
+        if not params_str:
+            QMessageBox.information(self, "Load from model",
+                                    f"{self._model} has no built-in parameters defined.")
+            return
+        suggested = parse_ollama_model_params(params_str)
+        applied = 0
+        for key, val in suggested.items():
+            if key not in self._param_rows:
+                continue
+            cb, sb = self._param_rows[key]
+            try:
+                sb.setValue(float(val) if isinstance(sb, QDoubleSpinBox) else int(val))
+                cb.setChecked(True)
+                applied += 1
+            except Exception:
+                pass
+        if applied:
+            QMessageBox.information(self, "Load from model",
+                                    f"Applied {applied} parameter(s) from {self._model}.\n"
+                                    "Review the checked values and uncheck any you don't want.")
+        else:
+            QMessageBox.information(self, "Load from model",
+                                    f"No matching parameters found in {self._model}'s definition.")
+
+    def _show_help(self, btn: QPushButton, text: str):
+        popup = _HelpPopup(text)
+        popup.show_near(btn.mapToGlobal(QPoint(0, btn.height())))
+
+    def _reset_all(self):
+        for cb, _ in self._param_rows.values():
+            cb.setChecked(False)
+
+    def _refresh_inj_list(self):
+        self._inj_list.clear()
+        for inj in self._injections:
+            role = "sys" if inj.get("role") == "system" else "user"
+            src = inj.get("path", "") or "(inline text)"
+            self._inj_list.addItem(f"[{role}]  {inj.get('label', '?')}  —  {src}")
+
+    def _add_injection(self):
+        dlg = InjectionEditDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._injections.append(dlg.value())
+            self._refresh_inj_list()
+
+    def _edit_injection(self):
+        row = self._inj_list.currentRow()
+        if row < 0:
+            return
+        dlg = InjectionEditDialog(self, self._injections[row])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._injections[row] = dlg.value()
+            self._refresh_inj_list()
+
+    def _delete_injection(self):
+        row = self._inj_list.currentRow()
+        if row >= 0:
+            self._injections.pop(row)
+            self._refresh_inj_list()
+
+    def model_params(self) -> dict:
+        result = {}
+        for key, (cb, sb) in self._param_rows.items():
+            if cb.isChecked():
+                result[key] = sb.value()
+        return result
+
+    def injections(self) -> list:
+        return list(self._injections)
+
+
+class ShareTargetDialog(QDialog):
+    """Add or edit a single share target entry."""
+
+    KINDS = ["local_folder", "scp", "sftp", "taildrop", "ntfy", "command", "telegram"]
+    FORMATS = ["html", "md", "txt"]
+
+    def __init__(self, parent, target=None):
+        super().__init__(parent)
+        target = target or {}
+        self.setWindowTitle("Edit share target" if target else "Add share target")
+        self.resize(480, 300)
+        root = QVBoxLayout(self)
+
+        form = QFormLayout()
+        root.addLayout(form)
+
+        self.name_field = QLineEdit(target.get("name", ""))
+        self.name_field.setPlaceholderText("My share target")
+        form.addRow("Name", self.name_field)
+
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItems(self.KINDS)
+        kind = target.get("kind", "local_folder")
+        if kind in self.KINDS:
+            self.kind_combo.setCurrentText(kind)
+        form.addRow("Kind", self.kind_combo)
+
+        # Per-kind field panels inside a stacked widget
+        self._stack = QStackedWidget()
+        self._panels = {}
+        root.addWidget(self._stack)
+
+        def _panel(kind_key):
+            w = QWidget()
+            f = QFormLayout(w)
+            f.setContentsMargins(0, 4, 0, 0)
+            self._panels[kind_key] = (w, f)
+            self._stack.addWidget(w)
+            return f
+
+        # local_folder
+        f = _panel("local_folder")
+        self.lf_path = QLineEdit(target.get("path", ""))
+        self.lf_path.setPlaceholderText("~/Documents/scratch-shares")
+        path_row = QWidget()
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.addWidget(self.lf_path)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(lambda: self._browse_folder(self.lf_path))
+        path_layout.addWidget(browse_btn)
+        self.lf_format = QComboBox()
+        self.lf_format.addItems(self.FORMATS)
+        self.lf_format.setCurrentText(target.get("format", "html") if kind == "local_folder" else "html")
+        f.addRow("Folder path", path_row)
+        f.addRow("File format", self.lf_format)
+
+        # scp
+        f = _panel("scp")
+        self.scp_dest = QLineEdit(target.get("destination", "") if kind == "scp" else "")
+        self.scp_dest.setPlaceholderText("nova:/home/ash/inbox/")
+        self.scp_format = QComboBox()
+        self.scp_format.addItems(self.FORMATS)
+        self.scp_format.setCurrentText(target.get("format", "html") if kind == "scp" else "html")
+        f.addRow("Destination", self.scp_dest)
+        f.addRow("File format", self.scp_format)
+
+        # sftp
+        f = _panel("sftp")
+        self.sftp_dest = QLineEdit(target.get("destination", "") if kind == "sftp" else "")
+        self.sftp_dest.setPlaceholderText("user@host:/path/to/folder/")
+        self.sftp_format = QComboBox()
+        self.sftp_format.addItems(self.FORMATS)
+        self.sftp_format.setCurrentText(target.get("format", "html") if kind == "sftp" else "html")
+        f.addRow("Destination", self.sftp_dest)
+        f.addRow("File format", self.sftp_format)
+
+        # taildrop
+        f = _panel("taildrop")
+        self.td_device = QLineEdit(target.get("device", "") if kind == "taildrop" else "")
+        self.td_device.setPlaceholderText("atlas  (Tailscale device name)")
+        self.td_format = QComboBox()
+        self.td_format.addItems(self.FORMATS)
+        self.td_format.setCurrentText(target.get("format", "html") if kind == "taildrop" else "html")
+        f.addRow("Device name", self.td_device)
+        f.addRow("File format", self.td_format)
+
+        # ntfy
+        f = _panel("ntfy")
+        self.ntfy_url = QLineEdit(target.get("url", "") if kind == "ntfy" else "")
+        self.ntfy_url.setPlaceholderText("https://ntfy.sh/my-topic")
+        self.ntfy_token = QLineEdit(target.get("token", "") if kind == "ntfy" else "")
+        self.ntfy_token.setPlaceholderText("optional auth token")
+        self.ntfy_token.setEchoMode(QLineEdit.EchoMode.Password)
+        f.addRow("Topic URL", self.ntfy_url)
+        f.addRow("Auth token", self.ntfy_token)
+
+        # command
+        f = _panel("command")
+        raw_cmd = target.get("command", "") if kind == "command" else ""
+        if isinstance(raw_cmd, list):
+            raw_cmd = shlex.join(raw_cmd)
+        self.cmd_command = QLineEdit(raw_cmd)
+        self.cmd_command.setPlaceholderText("xclip -selection clipboard   (use {file} or {text})")
+        self.cmd_format = QComboBox()
+        self.cmd_format.addItems(self.FORMATS)
+        self.cmd_format.setCurrentText(target.get("format", "html") if kind == "command" else "html")
+        f.addRow("Command", self.cmd_command)
+        f.addRow("File format", self.cmd_format)
+
+        # telegram (extra chat as share target)
+        f = _panel("telegram")
+        self.tg_chat_id = QLineEdit(str(target.get("chat_id", "")) if kind == "telegram" else "")
+        self.tg_chat_id.setPlaceholderText("numeric chat ID — find it in the Telegram tab")
+        f.addRow("Chat ID", self.tg_chat_id)
+
+        self.kind_combo.currentTextChanged.connect(self._on_kind_changed)
+        self._on_kind_changed(self.kind_combo.currentText())
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _on_kind_changed(self, kind):
+        widget = self._panels.get(kind, (None,))[0]
+        if widget:
+            self._stack.setCurrentWidget(widget)
+
+    def _browse_folder(self, field):
+        start = field.text() or str(Path.home())
+        path = QFileDialog.getExistingDirectory(self, "Choose folder", start)
+        if path:
+            field.setText(path)
+
+    def value(self):
+        kind = self.kind_combo.currentText()
+        name = self.name_field.text().strip() or kind
+        t = {"name": name, "kind": kind}
+        if kind == "local_folder":
+            t["path"] = self.lf_path.text().strip()
+            t["format"] = self.lf_format.currentText()
+        elif kind == "scp":
+            t["destination"] = self.scp_dest.text().strip()
+            t["format"] = self.scp_format.currentText()
+        elif kind == "sftp":
+            t["destination"] = self.sftp_dest.text().strip()
+            t["format"] = self.sftp_format.currentText()
+        elif kind == "taildrop":
+            t["device"] = self.td_device.text().strip()
+            t["format"] = self.td_format.currentText()
+        elif kind == "ntfy":
+            t["url"] = self.ntfy_url.text().strip()
+            tok = self.ntfy_token.text().strip()
+            if tok:
+                t["token"] = tok
+        elif kind == "command":
+            raw = self.cmd_command.text().strip()
+            t["command"] = shlex.split(raw) if raw else []
+            t["format"] = self.cmd_format.currentText()
+        elif kind == "telegram":
+            t["chat_id"] = self.tg_chat_id.text().strip()
+        return t
+
+
 class ConfigDialog(QDialog):
     """Small configuration panel for AI and share targets."""
 
@@ -618,7 +1448,27 @@ class ConfigDialog(QDialog):
 
         telegram = config.get("telegram", {})
         tg_tab = QWidget(self)
-        tg_form = QFormLayout(tg_tab)
+        tg_root = QVBoxLayout(tg_tab)
+        tg_root.addLayout(self._help_header(
+            "Telegram setup",
+            "Setting up Telegram sharing:\n\n"
+            "1. Open Telegram and chat with @BotFather.\n"
+            "2. Send /newbot and follow the prompts — you'll receive a bot token.\n"
+            "3. Paste the token in 'Bot token' below.\n"
+            "4. Send any message to your new bot (or add it to a group/channel).\n"
+            "   For a channel: add the bot as an admin, then post something.\n"
+            "5. Click 'Fetch recent chats' — discovered chat IDs appear in the list.\n"
+            "6. Click a chat in the list to set it as the default.\n\n"
+            "Why does 'Fetch recent chats' return 0 results?\n"
+            "• getUpdates only sees messages sent TO the bot since it was last polled.\n"
+            "  Send the bot a message first, then fetch.\n"
+            "• If you have a webhook set on this bot token, getUpdates always returns\n"
+            "  empty — webhooks and polling are mutually exclusive in the Bot API.\n"
+            "  Delete the webhook with: api.telegram.org/bot<TOKEN>/deleteWebhook\n\n"
+            "You can always type a chat ID directly — use @userinfobot to find your own."
+        ))
+        tg_form = QFormLayout()
+        tg_root.addLayout(tg_form)
         self.telegram_token = QLineEdit(telegram.get("bot_token", ""))
         self.telegram_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.telegram_chat = QLineEdit(telegram.get("default_chat_id", ""))
@@ -626,44 +1476,136 @@ class ConfigDialog(QDialog):
         self.telegram_parse_mode.addItems(["", "HTML", "MarkdownV2"])
         self.telegram_parse_mode.setCurrentText(telegram.get("parse_mode", ""))
         self.telegram_recent = QListWidget()
+        self.telegram_recent.setMaximumHeight(120)
         for chat in telegram.get("recent_chats", []):
             label = chat.get("title") or chat.get("username") or str(chat.get("id", ""))
             self.telegram_recent.addItem(f"{label} :: {chat.get('id', '')}")
+        self.telegram_recent.itemClicked.connect(
+            lambda item: self.telegram_chat.setText(item.text().rsplit("::", 1)[-1].strip())
+        )
         refresh_btn = QPushButton("Fetch recent chats")
         refresh_btn.clicked.connect(self._fetch_recent_chats)
         tg_form.addRow("Bot token", self.telegram_token)
         tg_form.addRow("Default chat id", self.telegram_chat)
         tg_form.addRow("Parse mode", self.telegram_parse_mode)
         tg_form.addRow(refresh_btn)
-        tg_form.addRow("Recent chats", self.telegram_recent)
+        tg_form.addRow("Recent chats (click to set default)", self.telegram_recent)
         tabs.addTab(tg_tab, "Telegram")
 
-        ollama = config.get("ollama", {})
+        ollama = migrate_ollama_config(config.get("ollama", {}))
+        self._profiles: list[dict] = list(ollama.get("profiles") or [
+            {"name": "Default", "model": "llama3.2", "system": "", "model_params": {}, "context_injections": []}
+        ])
+        active_name = ollama.get("active_profile", "")
+        self._active_profile_idx = next(
+            (i for i, p in enumerate(self._profiles) if p.get("name") == active_name), 0
+        )
+        self._ollama_model_params: dict = {}
+        self._ollama_injections: list = []
+
         ollama_tab = QWidget(self)
-        ollama_form = QFormLayout(ollama_tab)
+        ollama_root = QVBoxLayout(ollama_tab)
+        ollama_root.addLayout(self._help_header(
+            "Ollama setup",
+            "1. Install Ollama (ollama.com) and start the service.\n"
+            "2. Pull a model:  ollama pull mistral\n"
+            "3. Set the base URL and click Test.\n"
+            "4. Use Profiles to save different model+prompt+parameter combinations.\n"
+            "   Select a profile in 'Ask Ollama' to switch mid-session."
+        ))
+
+        # ── global settings ───────────────────────────────────────────────────
+        global_form = QFormLayout()
+        ollama_root.addLayout(global_form)
         self.ollama_base_url = QLineEdit(ollama.get("base_url", "http://localhost:11434"))
-        self.ollama_model = QLineEdit(ollama.get("model", "llama3.2"))
-        self.ollama_system = QTextEdit(ollama.get("system", ""))
-        self.ollama_system.setMinimumHeight(120)
-        ollama_form.addRow("Base URL", self.ollama_base_url)
-        ollama_form.addRow("Model", self.ollama_model)
+        url_row = QWidget()
+        url_hl = QHBoxLayout(url_row)
+        url_hl.setContentsMargins(0, 0, 0, 0)
+        url_hl.addWidget(self.ollama_base_url)
+        test_btn = QPushButton("Test")
+        test_btn.setFixedWidth(54)
+        test_btn.clicked.connect(self._test_ollama)
+        url_hl.addWidget(test_btn)
+        global_form.addRow("Base URL", url_row)
+
+        # ── profile management ────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #444;")
+        ollama_root.addWidget(sep)
+
+        prof_hdr_row = QHBoxLayout()
+        prof_hdr_row.addWidget(QLabel("Profiles"))
+        prof_hdr_row.addStretch()
+        ollama_root.addLayout(prof_hdr_row)
+
+        prof_row = QWidget()
+        prof_hl = QHBoxLayout(prof_row)
+        prof_hl.setContentsMargins(0, 0, 0, 0)
+        self._profile_combo = QComboBox()
+        for p in self._profiles:
+            self._profile_combo.addItem(p.get("name", "?"))
+        self._profile_combo.setCurrentIndex(self._active_profile_idx)
+        add_p = QPushButton("Add…");    add_p.setFixedWidth(54)
+        ren_p = QPushButton("Rename…"); ren_p.setFixedWidth(70)
+        del_p = QPushButton("Delete");  del_p.setFixedWidth(54)
+        add_p.clicked.connect(self._add_profile)
+        ren_p.clicked.connect(self._rename_profile)
+        del_p.clicked.connect(self._delete_profile)
+        prof_hl.addWidget(self._profile_combo, 1)
+        prof_hl.addWidget(add_p); prof_hl.addWidget(ren_p); prof_hl.addWidget(del_p)
+        ollama_root.addWidget(prof_row)
+
+        # ── per-profile settings ──────────────────────────────────────────────
+        ollama_form = QFormLayout()
+        ollama_root.addLayout(ollama_form)
+        self.ollama_model = QComboBox()
+        self.ollama_model.setEditable(True)
+        model_row = QWidget()
+        model_hl = QHBoxLayout(model_row)
+        model_hl.setContentsMargins(0, 0, 0, 0)
+        model_hl.addWidget(self.ollama_model, 1)
+        fetch_btn = QPushButton("Fetch models")
+        fetch_btn.clicked.connect(self._fetch_ollama_models)
+        model_hl.addWidget(fetch_btn)
+        self.ollama_system = QTextEdit()
+        self.ollama_system.setMinimumHeight(90)
+        params_btn = QPushButton("Model parameters…")
+        params_btn.clicked.connect(self._open_ollama_params)
+        ollama_form.addRow("Model", model_row)
         ollama_form.addRow("System prompt", self.ollama_system)
+        ollama_form.addRow("", params_btn)
+
+        self._load_profile_fields()
+        # connect after initial load to avoid spurious save
+        self._profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         tabs.addTab(ollama_tab, "Ollama")
 
         targets_tab = QWidget(self)
         targets_layout = QVBoxLayout(targets_tab)
-        targets_help = QLabel(
-            "Share targets JSON. Kinds: local_folder, scp, sftp, taildrop, ntfy, command.\n"
-            "Examples:\n"
-            "[{\"name\":\"Nova inbox\",\"kind\":\"scp\",\"destination\":\"nova:/home/ash/inbox/\"},\n"
-            " {\"name\":\"Atlas Taildrop\",\"kind\":\"taildrop\",\"device\":\"atlas\"},\n"
-            " {\"name\":\"AI clipboard\",\"kind\":\"command\",\"command\":[\"xclip\",\"-selection\",\"clipboard\"]}]"
-        )
-        targets_help.setWordWrap(True)
-        self.share_targets = QTextEdit(json.dumps(config.get("share_targets", []), indent=2))
-        self.share_targets.setMinimumHeight(240)
-        targets_layout.addWidget(targets_help)
-        targets_layout.addWidget(self.share_targets, 1)
+        self._targets_data = list(config.get("share_targets", []))
+        self._targets_list = QListWidget()
+        self._targets_list.itemDoubleClicked.connect(self._edit_target)
+        self._refresh_targets_list()
+        targets_layout.addWidget(self._targets_list, 1)
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add…")
+        edit_btn = QPushButton("Edit…")
+        del_btn = QPushButton("Delete")
+        up_btn = QPushButton("↑")
+        dn_btn = QPushButton("↓")
+        add_btn.clicked.connect(self._add_target)
+        edit_btn.clicked.connect(self._edit_target)
+        del_btn.clicked.connect(self._delete_target)
+        up_btn.clicked.connect(self._move_target_up)
+        dn_btn.clicked.connect(self._move_target_dn)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(del_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(up_btn)
+        btn_row.addWidget(dn_btn)
+        targets_layout.addLayout(btn_row)
         tabs.addTab(targets_tab, "Share targets")
 
         buttons = QDialogButtonBox(
@@ -672,6 +1614,192 @@ class ConfigDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    def _refresh_targets_list(self):
+        self._targets_list.clear()
+        for t in self._targets_data:
+            name = t.get("name") or t.get("kind", "?")
+            kind = t.get("kind", "")
+            self._targets_list.addItem(f"{name}  [{kind}]")
+
+    def _add_target(self):
+        dlg = ShareTargetDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._targets_data.append(dlg.value())
+            self._refresh_targets_list()
+            self._targets_list.setCurrentRow(len(self._targets_data) - 1)
+
+    def _edit_target(self):
+        row = self._targets_list.currentRow()
+        if row < 0:
+            return
+        dlg = ShareTargetDialog(self, self._targets_data[row])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._targets_data[row] = dlg.value()
+            self._refresh_targets_list()
+            self._targets_list.setCurrentRow(row)
+
+    def _delete_target(self):
+        row = self._targets_list.currentRow()
+        if row < 0:
+            return
+        name = self._targets_data[row].get("name", "this target")
+        reply = QMessageBox.question(self, "Delete target", f"Remove '{name}'?")
+        if reply == QMessageBox.StandardButton.Yes:
+            del self._targets_data[row]
+            self._refresh_targets_list()
+
+    def _move_target_up(self):
+        row = self._targets_list.currentRow()
+        if row > 0:
+            self._targets_data[row - 1], self._targets_data[row] = (
+                self._targets_data[row], self._targets_data[row - 1]
+            )
+            self._refresh_targets_list()
+            self._targets_list.setCurrentRow(row - 1)
+
+    def _move_target_dn(self):
+        row = self._targets_list.currentRow()
+        if 0 <= row < len(self._targets_data) - 1:
+            self._targets_data[row + 1], self._targets_data[row] = (
+                self._targets_data[row], self._targets_data[row + 1]
+            )
+            self._refresh_targets_list()
+            self._targets_list.setCurrentRow(row + 1)
+
+    def _help_header(self, title, text):
+        hl = QHBoxLayout()
+        hl.addStretch()
+        btn = QPushButton("?")
+        btn.setFixedSize(22, 22)
+        btn.setToolTip("Click for setup guide")
+        btn.clicked.connect(lambda: QMessageBox.information(self, title, text))
+        hl.addWidget(btn)
+        return hl
+
+    # ── profile helpers ───────────────────────────────────────────────────────
+
+    def _save_current_profile(self):
+        if not self._profiles:
+            return
+        p = self._profiles[self._active_profile_idx]
+        p["model"] = self.ollama_model.currentText().strip() or "llama3.2"
+        p["system"] = self.ollama_system.toPlainText()
+        p["model_params"] = self._ollama_model_params
+        p["context_injections"] = self._ollama_injections
+
+    def _load_profile_fields(self):
+        p = self._profiles[self._active_profile_idx]
+        self._ollama_model_params = dict(p.get("model_params") or {})
+        self._ollama_injections = list(p.get("context_injections") or [])
+        model = p.get("model", "llama3.2")
+        self.ollama_model.blockSignals(True)
+        if self.ollama_model.findText(model) < 0:
+            self.ollama_model.insertItem(0, model)
+        self.ollama_model.setCurrentText(model)
+        self.ollama_model.blockSignals(False)
+        self.ollama_system.blockSignals(True)
+        self.ollama_system.setPlainText(p.get("system", ""))
+        self.ollama_system.blockSignals(False)
+
+    def _on_profile_changed(self, idx: int):
+        if idx == self._active_profile_idx:
+            return
+        self._save_current_profile()
+        self._active_profile_idx = idx
+        self._load_profile_fields()
+
+    def _add_profile(self):
+        name, ok = QInputDialog.getText(self, "Add profile", "Profile name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if any(p.get("name") == name for p in self._profiles):
+            QMessageBox.warning(self, "Profile", f"'{name}' already exists.")
+            return
+        self._save_current_profile()
+        reply = QMessageBox.question(self, "Add profile", "Copy current profile as starting point?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        new_p = dict(self._profiles[self._active_profile_idx]) if reply == QMessageBox.StandardButton.Yes \
+            else {"model_params": {}, "context_injections": []}
+        new_p["name"] = name
+        self._profiles.append(new_p)
+        self._profile_combo.blockSignals(True)
+        self._profile_combo.addItem(name)
+        self._profile_combo.blockSignals(False)
+        self._active_profile_idx = len(self._profiles) - 1
+        self._profile_combo.setCurrentIndex(self._active_profile_idx)
+
+    def _rename_profile(self):
+        idx = self._profile_combo.currentIndex()
+        old = self._profiles[idx].get("name", "")
+        name, ok = QInputDialog.getText(self, "Rename profile", "New name:", text=old)
+        if not ok or not name.strip() or name.strip() == old:
+            return
+        name = name.strip()
+        if any(p.get("name") == name for p in self._profiles):
+            QMessageBox.warning(self, "Profile", f"'{name}' already exists.")
+            return
+        self._profiles[idx]["name"] = name
+        self._profile_combo.setItemText(idx, name)
+
+    def _delete_profile(self):
+        if len(self._profiles) <= 1:
+            QMessageBox.information(self, "Profile", "Cannot delete the last profile.")
+            return
+        idx = self._profile_combo.currentIndex()
+        name = self._profiles[idx].get("name", "?")
+        if QMessageBox.question(self, "Delete profile", f"Delete '{name}'?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        self._profiles.pop(idx)
+        self._profile_combo.blockSignals(True)
+        self._profile_combo.removeItem(idx)
+        self._active_profile_idx = min(idx, len(self._profiles) - 1)
+        self._profile_combo.setCurrentIndex(self._active_profile_idx)
+        self._profile_combo.blockSignals(False)
+        self._load_profile_fields()
+
+    def _open_ollama_params(self):
+        base_url = self.ollama_base_url.text().strip() or "http://localhost:11434"
+        model = self.ollama_model.currentText().strip()
+        dlg = OllamaParamsDialog(self, self._ollama_model_params, self._ollama_injections,
+                                 base_url=base_url, model=model)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._ollama_model_params = dlg.model_params()
+            self._ollama_injections = dlg.injections()
+
+    def _test_ollama(self):
+        base_url = (self.ollama_base_url.text().strip() or "http://localhost:11434").rstrip("/")
+        try:
+            with urllib.request.urlopen(f"{base_url}/api/version", timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            version = data.get("version", "unknown")
+            QMessageBox.information(self, "Ollama", f"Connected — Ollama {version}")
+        except Exception as e:
+            QMessageBox.warning(self, "Ollama", f"Could not reach {base_url}:\n{e}")
+
+    def _fetch_ollama_models(self):
+        base_url = (self.ollama_base_url.text().strip() or "http://localhost:11434").rstrip("/")
+        try:
+            with urllib.request.urlopen(f"{base_url}/api/tags", timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            models = [m["name"] for m in data.get("models", [])]
+        except Exception as e:
+            QMessageBox.warning(self, "Ollama", f"Could not fetch models:\n{e}")
+            return
+        if not models:
+            QMessageBox.information(
+                self, "Ollama models",
+                "No models found. Pull one first:\n  ollama pull mistral"
+            )
+            return
+        current = self.ollama_model.currentText()
+        self.ollama_model.clear()
+        self.ollama_model.addItems(models)
+        if current in models:
+            self.ollama_model.setCurrentText(current)
 
     def _fetch_recent_chats(self):
         token = self.telegram_token.text().strip()
@@ -705,12 +1833,8 @@ class ConfigDialog(QDialog):
             QMessageBox.warning(self, "Telegram", f"Could not fetch chats:\n{e}")
 
     def value(self):
-        try:
-            share_targets = json.loads(self.share_targets.toPlainText() or "[]")
-            if not isinstance(share_targets, list):
-                raise ValueError("share_targets must be a list")
-        except Exception as e:
-            raise ValueError(f"Invalid share targets JSON: {e}") from e
+        self._save_current_profile()
+        share_targets = list(self._targets_data)
 
         recent = []
         for row in range(self.telegram_recent.count()):
@@ -729,8 +1853,8 @@ class ConfigDialog(QDialog):
             },
             "ollama": {
                 "base_url": self.ollama_base_url.text().strip() or "http://localhost:11434",
-                "model": self.ollama_model.text().strip() or "llama3.2",
-                "system": self.ollama_system.toPlainText(),
+                "active_profile": self._profiles[self._active_profile_idx].get("name") if self._profiles else "Default",
+                "profiles": self._profiles,
             },
             "share_targets": share_targets,
             "ui": self._config.get("ui", normalized_ui_settings({})),
@@ -861,6 +1985,7 @@ class ScratchPad(QWidget):
         self._active_pane_index = 0
         self._shortcuts = []
         self._term_height = 200
+        self._chat_pages: dict[int, list] = {}  # page_index → message history
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -1230,10 +2355,31 @@ class ScratchPad(QWidget):
         pane = QuillPane(self, page)
         pane.content_changed.connect(
             lambda pi, html, origin=pane: self._on_any_content_changed(pi, html, origin))
+        pane.page_loaded.connect(
+            lambda pi, p=pane: self._on_pane_page_loaded(p, pi))
+        pane.chat_message_sent.connect(self._on_chat_message)
+        pane.restore_history_requested.connect(self._on_restore_history)
         self._panes.append(pane)
         self.h_split.addWidget(pane)
         pane.load_page(page)
         return pane
+
+    def _on_pane_page_loaded(self, pane: "QuillPane", page_idx: int):
+        if page_idx in self._chat_pages:
+            pane.set_chat_mode(True)
+        elif is_chat_page_html(self.notes["pages"][page_idx]):
+            pane.set_chat_mode(True, restore_available=True)
+        else:
+            pane.set_chat_mode(False)
+
+    def _on_restore_history(self, page_idx: int):
+        messages = parse_chat_page_html(self.notes["pages"][page_idx])
+        if messages is None:
+            return
+        self._chat_pages[page_idx] = messages
+        for pane in self._panes:
+            if pane.page_index == page_idx:
+                pane.set_history_restored()
 
     def _on_any_content_changed(self, page_index, html, origin_pane=None):
         for pane in self._panes:
@@ -1472,29 +2618,86 @@ class ScratchPad(QWidget):
         if self.pinned:
             self.raise_()
 
-    def _ask_ollama(self):
-        prompt, ok = QInputDialog.getText(self, "Ask Ollama", "Prompt:")
-        if not ok or not prompt.strip():
-            return
-        self._send_to_ollama(prompt.strip())
+    def _active_ollama_profile(self, override: str | None = None) -> dict:
+        ollama = self.config.get("ollama", {})
+        profiles = ollama.get("profiles") or []
+        if not profiles:
+            return ollama  # backward compat with flat config
+        name = override or ollama.get("active_profile")
+        if name:
+            p = next((p for p in profiles if p.get("name") == name), None)
+            if p:
+                return p
+        return profiles[0]
 
-    def _send_to_ollama(self, prompt):
+    def _ask_ollama(self):
+        ollama = self.config.get("ollama", {})
+        profiles = ollama.get("profiles") or []
+        active = ollama.get("active_profile", "")
+        dlg = OllamaPromptDialog(self, profiles, active)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.value():
+            return
+        self._send_to_ollama(dlg.value(), profile_name=dlg.selected_profile())
+
+    def _send_to_ollama(self, prompt, *, chat_page_idx=None, profile_name: str | None = None):
+        """Start a new chat from the current note, or append a follow-up to an existing chat page."""
+        ollama = self.config.get("ollama", {})
+        profile = self._active_ollama_profile(override=profile_name)
+        model = profile.get("model", "llama3.2") or "llama3.2"
+        system = profile.get("system") or None
+        base_url = (ollama.get("base_url") or "http://localhost:11434").rstrip("/")
+        model_params = profile.get("model_params") or {}
+        options = dict(model_params) if model_params else None
+
+        is_followup = chat_page_idx is not None
+
+        if is_followup:
+            history = self._chat_pages[chat_page_idx]
+            history.append({"role": "user", "content": prompt})
+            payload = json.dumps(
+                ollama_chat_payload(history, model=model, system=system, options=options)
+            ).encode()
+            req = urllib.request.Request(
+                f"{base_url}/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            self._stream_ollama_chat(req, chat_page_idx, use_chat_endpoint=True)
+            return
+
+        # Process context injections for new chats
+        injections = profile.get("context_injections") or []
+        extra_system_parts = []
+        context_messages: list[dict] = []
+        for inj in injections:
+            content = _load_injection_content(inj)
+            if not content:
+                continue
+            if inj.get("role") == "system":
+                label = inj.get("label", "Context")
+                extra_system_parts.append(f"[{label}]\n{content}")
+            else:
+                label = inj.get("label", "Injected context")
+                context_messages.append({"role": "user", "content": f"[{label}]\n{content}"})
+                context_messages.append({"role": "assistant", "content": "Understood."})
+
+        if extra_system_parts:
+            system = ((system + "\n\n") if system else "") + "\n\n".join(extra_system_parts)
+
         page_idx = self._active_pane().page_index
         text_content = plain_text_from_html(self.notes["pages"][page_idx])
-        ollama = self.config.get("ollama", {})
+        history: list[dict] = list(context_messages)
+        if text_content.strip():
+            history.append({"role": "user", "content": f"Context from my note:\n{text_content}"})
+            history.append({"role": "assistant", "content": "Got it. What would you like to know?"})
+        history.append({"role": "user", "content": prompt})
 
-        full_prompt = f"Context:\n{text_content}\n\nUser request:\n{prompt}"
         payload = json.dumps(
-            ollama_generate_payload(
-                full_prompt,
-                model=ollama.get("model", "llama3.2") or "llama3.2",
-                system=ollama.get("system") or None,
-            )
+            ollama_chat_payload(history, model=model, system=system, options=options)
         ).encode()
-        base_url = (ollama.get("base_url") or "http://localhost:11434").rstrip("/")
-
         req = urllib.request.Request(
-            f"{base_url}/api/generate",
+            f"{base_url}/api/chat",
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1504,42 +2707,75 @@ class ScratchPad(QWidget):
             self._flush_save()
             response_idx = self._active_pane().page_index + 1
             self.notes["pages"].insert(response_idx, "")
+            self._chat_pages[response_idx] = history
             self._active_pane().load_page(response_idx)
+            self._active_pane().set_edit_mode(False)
+            self._active_pane().set_chat_mode(True)
+            # loadNoteSource is async in the iframe — retry result-view once it settles
+            pane_ref = self._active_pane()
+            QTimer.singleShot(350, lambda p=pane_ref: p.set_edit_mode(False))
             self._flush_save()
             self._update_nav()
-
-            def _stream():
-                chunks = []
-                try:
-                    with urllib.request.urlopen(req, timeout=300) as resp:
-                        for chunk in ollama_stream_chunks(resp):
-                            chunks.append(chunk)
-                            self._ollama_chunk.emit(response_idx, chunk)
-                    response_text = "".join(chunks)
-                except Exception as e:
-                    response_text = f"Error: {e}"
-                self._ollama_done.emit(response_idx, response_text)
-
-            threading.Thread(target=_stream, daemon=True).start()
+            self._stream_ollama_chat(req, response_idx, use_chat_endpoint=True)
 
         self._after_content_snapshot(_after_snapshot)
 
+    def _stream_ollama_chat(self, req, page_index, *, use_chat_endpoint=True):
+        chunk_fn = ollama_chat_stream_chunks if use_chat_endpoint else ollama_stream_chunks
+
+        def _stream():
+            chunks = []
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    for chunk in chunk_fn(resp):
+                        chunks.append(chunk)
+                        self._ollama_chunk.emit(page_index, chunk)
+                response_text = "".join(chunks)
+            except Exception as e:
+                response_text = f"Error: {e}"
+            self._ollama_done.emit(page_index, response_text)
+
+        threading.Thread(target=_stream, daemon=True).start()
+
+    def _on_chat_message(self, page_index, prompt):
+        if page_index not in self._chat_pages:
+            return
+        self._send_to_ollama(prompt, chat_page_idx=page_index)
+
     def _on_ollama_chunk(self, page_index, chunk):
-        self.notes["pages"][page_index] += chunk
-        text = self.notes["pages"][page_index]
-        for pane in self._panes:
-            if pane.page_index == page_index and pane._editor_ready:
-                pane.view.page().runJavaScript(
-                    f"setPreviewHtml({json.dumps(preformatted_html(text))})")
+        if page_index in self._chat_pages:
+            history = self._chat_pages[page_index]
+            if not history or history[-1]["role"] != "assistant":
+                history.append({"role": "assistant", "content": ""})
+            history[-1]["content"] += chunk
+            rendered = chat_page_html(history)
+            for pane in self._panes:
+                if pane.page_index == page_index:
+                    pane.show_chat_html(rendered)
+        else:
+            self.notes["pages"][page_index] += chunk
+            rendered = preformatted_html(self.notes["pages"][page_index])
+            js = f"setPreviewHtml({json.dumps(rendered)}); setEditMode(false)"
+            for pane in self._panes:
+                if pane.page_index == page_index and pane._editor_ready:
+                    pane.view.page().runJavaScript(js)
         self._update_nav()
 
     def _on_ollama_done(self, page_index, full_text):
-        html = preformatted_html(full_text)
-        self.notes["pages"][page_index] = html
-        self._flush_save()
-        for pane in self._panes:
-            if pane.page_index == page_index and pane._editor_ready:
-                pane._send_content(html)
+        if page_index in self._chat_pages:
+            final_html = chat_page_html(self._chat_pages[page_index])
+            self.notes["pages"][page_index] = final_html
+            self._flush_save()
+            for pane in self._panes:
+                if pane.page_index == page_index:
+                    pane.show_chat_html(final_html)
+        else:
+            final_html = preformatted_html(full_text)
+            self.notes["pages"][page_index] = final_html
+            self._flush_save()
+            for pane in self._panes:
+                if pane.page_index == page_index and pane._editor_ready:
+                    pane._send_content(final_html)
         self._update_nav()
 
     def _context_menu_style(self):
