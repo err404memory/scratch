@@ -4,7 +4,6 @@ import html
 import http.server
 import json
 import logging
-import os
 import re
 import socket as _socket
 import socketserver
@@ -37,6 +36,7 @@ SHORTCUTS: list[tuple[str, str]] = [
 @dataclass(frozen=True, slots=True)
 class Rect:
     """Immutable rectangle with integer coordinates and dimensions."""
+
     x: int
     y: int
     width: int
@@ -66,7 +66,9 @@ def normalize_notes(data: Any) -> dict[str, Any]:
 
     return {
         "pages": pages or [""],
-        "window": data.get("window", {}) if isinstance(data.get("window"), dict) else {},
+        "window": data.get("window", {})
+        if isinstance(data.get("window"), dict)
+        else {},
     }
 
 
@@ -143,7 +145,9 @@ def preserve_text_newlines(source: str) -> str:
         elif "\n" not in part and "\r" not in part:
             rendered.append(part)
         elif part.strip():
-            rendered.append(part.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>"))
+            rendered.append(
+                part.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+            )
     return "".join(rendered)
 
 
@@ -152,26 +156,26 @@ def wrap_note_body(body_html: str) -> str:
     bg = "linear-gradient(160deg,#f8f6f1 0%,#edeae0 100%)"
     return (
         '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>'
-        f'body{{background:{bg};color:#1c2430;'
-        'font-family:Inter,system-ui,sans-serif;font-size:13px;line-height:1.6;'
-        'margin:0;padding:18px 20px;min-height:100vh;}'
-        'h1,h2,h3{color:#16324f;margin:.2em 0 .5em;line-height:1.2;}'
-        'h1{font-size:1.45rem;}h2{font-size:1.2rem;}h3{font-size:1rem;}'
-        'p,ul,ol,pre,blockquote,details{margin:.7em 0;}'
-        'a{color:#5c7cfa;}'
-        'code{background:rgba(22,50,79,.09);color:#0f3b63;padding:1px 5px;border-radius:4px;'
-        'font-family:ui-monospace,monospace;}'
-        'pre{background:#15202b;color:#d7e0ea;padding:14px;border-radius:10px;overflow:auto;}'
-        'pre code{background:transparent;color:inherit;padding:0;}'
-        'blockquote{border-left:4px solid #9aacb8;padding-left:12px;color:#4e5968;}'
-        'table{border-collapse:collapse;}td,th{border:1px solid rgba(35,44,58,.15);padding:4px 8px;}'
-        'img{max-width:100%;}'
-        'details{border:1px solid rgba(35,44,58,.15);border-radius:8px;padding:8px 12px;}'
-        'summary{cursor:pointer;font-weight:600;color:#16324f;}'
-        '::-webkit-scrollbar{width:0;height:0;}'
-        '</style></head><body>'
-        f'{body_html}'
-        '</body></html>'
+        f"body{{background:{bg};color:#1c2430;"
+        "font-family:Inter,system-ui,sans-serif;font-size:13px;line-height:1.6;"
+        "margin:0;padding:18px 20px;min-height:100vh;}"
+        "h1,h2,h3{color:#16324f;margin:.2em 0 .5em;line-height:1.2;}"
+        "h1{font-size:1.45rem;}h2{font-size:1.2rem;}h3{font-size:1rem;}"
+        "p,ul,ol,pre,blockquote,details{margin:.7em 0;}"
+        "a{color:#5c7cfa;}"
+        "code{background:rgba(22,50,79,.09);color:#0f3b63;padding:1px 5px;border-radius:4px;"
+        "font-family:ui-monospace,monospace;}"
+        "pre{background:#15202b;color:#d7e0ea;padding:14px;border-radius:10px;overflow:auto;}"
+        "pre code{background:transparent;color:inherit;padding:0;}"
+        "blockquote{border-left:4px solid #9aacb8;padding-left:12px;color:#4e5968;}"
+        "table{border-collapse:collapse;}td,th{border:1px solid rgba(35,44,58,.15);padding:4px 8px;}"
+        "img{max-width:100%;}"
+        "details{border:1px solid rgba(35,44,58,.15);border-radius:8px;padding:8px 12px;}"
+        "summary{cursor:pointer;font-weight:600;color:#16324f;}"
+        "::-webkit-scrollbar{width:0;height:0;}"
+        "</style></head><body>"
+        f"{body_html}"
+        "</body></html>"
     )
 
 
@@ -217,7 +221,7 @@ def render_note_source(source: str) -> str:
                 code_lang = ""
                 code_line_count = 0
             else:
-                fence = line.strip()[:3]
+                _fence = line.strip()[:3]
                 lang = line.strip()[3:].strip()
                 code_lang = lang or ""
                 rendered_lines.append(
@@ -302,7 +306,9 @@ def plain_text_from_config(config: dict[str, Any]) -> str:
     return re.sub(r"<[^>]+>", "", content)
 
 
-def default_livecodes_config(language: str = "markdown", content: str = "") -> dict[str, Any]:
+def default_livecodes_config(
+    language: str = "markdown", content: str = ""
+) -> dict[str, Any]:
     """
     Create a default LiveCodes configuration for a given language and content.
 
@@ -345,7 +351,9 @@ def looks_like_css(source: str) -> bool:
     text = source.strip()
     if not text or "<" in text:
         return False
-    return bool(re.search(r"[.#]?[A-Za-z0-9_:-]+\s*\{[^{}]+:[^{}]+;?\s*\}", text, re.DOTALL))
+    return bool(
+        re.search(r"[.#]?[A-Za-z0-9_:-]+\s*\{[^{}]+:[^{}]+;?\s*\}", text, re.DOTALL)
+    )
 
 
 def _complete_livecodes_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -396,14 +404,23 @@ def livecodes_config_from_source(source: str) -> dict[str, Any]:
                 config["style"] = {"language": "css", "content": content}
             elif language in {"js", "javascript", "ts", "typescript"}:
                 config["script"] = {
-                    "language": "javascript" if language in {"js", "javascript"} else "typescript",
+                    "language": "javascript"
+                    if language in {"js", "javascript"}
+                    else "typescript",
                     "content": content,
                 }
             else:
                 markup_parts.append(f"```{language}\n{content}\n```")
         if markup_parts and not config["markup"].get("content"):
-            config["markup"] = {"language": "markdown", "content": "\n\n".join(markup_parts)}
-        if "style" in config and config["markup"].get("language") == "markdown" and not config["markup"].get("content"):
+            config["markup"] = {
+                "language": "markdown",
+                "content": "\n\n".join(markup_parts),
+            }
+        if (
+            "style" in config
+            and config["markup"].get("language") == "markdown"
+            and not config["markup"].get("content")
+        ):
             config["markup"] = {"language": "html", "content": CSS_PREVIEW_MARKUP}
         return _complete_livecodes_config(config)
 
@@ -411,10 +428,12 @@ def livecodes_config_from_source(source: str) -> dict[str, Any]:
     if stripped.startswith("<") or re.search(r"<[A-Za-z][^>]*>", source):
         return _complete_livecodes_config(default_livecodes_config("html", source))
     if looks_like_css(source):
-        return _complete_livecodes_config({
-            "markup": {"language": "html", "content": CSS_PREVIEW_MARKUP},
-            "style": {"language": "css", "content": source},
-        })
+        return _complete_livecodes_config(
+            {
+                "markup": {"language": "html", "content": CSS_PREVIEW_MARKUP},
+                "style": {"language": "css", "content": source},
+            }
+        )
     return _complete_livecodes_config(default_livecodes_config("markdown", source))
 
 
@@ -426,11 +445,15 @@ def livecodes_source_from_config(config: dict[str, Any]) -> str:
     parts: list[str] = []
 
     markup_content = markup.get("content", "") if isinstance(markup, dict) else ""
-    markup_language = markup.get("language", "markdown") if isinstance(markup, dict) else "markdown"
+    markup_language = (
+        markup.get("language", "markdown") if isinstance(markup, dict) else "markdown"
+    )
     has_style = bool(style.get("content", "")) if isinstance(style, dict) else False
     has_script = bool(script.get("content", "")) if isinstance(script, dict) else False
     if markup_content and markup_content != CSS_PREVIEW_MARKUP:
-        if markup_language == "markdown" or (markup_language == "html" and not has_style and not has_script):
+        if markup_language == "markdown" or (
+            markup_language == "html" and not has_style and not has_script
+        ):
             parts.append(markup_content)
         else:
             parts.append(f"```{markup_language}\n{markup_content}\n```")
@@ -440,7 +463,11 @@ def livecodes_source_from_config(config: dict[str, Any]) -> str:
         parts.append(f"```css\n{style_content}\n```")
 
     script_content = script.get("content", "") if isinstance(script, dict) else ""
-    script_language = script.get("language", "javascript") if isinstance(script, dict) else "javascript"
+    script_language = (
+        script.get("language", "javascript")
+        if isinstance(script, dict)
+        else "javascript"
+    )
     if script_content:
         parts.append(f"```{script_language}\n{script_content}\n```")
 
@@ -466,8 +493,6 @@ def migrate_v1_to_v2(notes: dict[str, Any]) -> dict[str, Any]:
         "pages": migrated_pages,
         "window": notes.get("window", {}),
     }
-
-
 
 
 def create_shortcuts(
@@ -598,6 +623,7 @@ def resize_rect(
 
 # ── LiveCodes local server ───────────────────────────────────────────────────
 
+
 class _CORSRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Static file handler that adds CORS headers for local app usage."""
 
@@ -616,7 +642,9 @@ class _CORSRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
 
-def start_livecodes_server(build_dir: Path = LIVECODES_BUILD_DIR, port: int = LIVECODES_PORT) -> tuple[threading.Thread, int]:
+def start_livecodes_server(
+    build_dir: Path = LIVECODES_BUILD_DIR, port: int = LIVECODES_PORT
+) -> tuple[threading.Thread, int]:
     """Start a background thread serving the LiveCodes build directory.
     Returns (thread, actual_port). Tries the requested port first, then
     increments until an available one is found.
@@ -634,10 +662,15 @@ def start_livecodes_server(build_dir: Path = LIVECODES_BUILD_DIR, port: int = LI
         except OSError:
             actual_port += 1
             if actual_port > port + 100:
-                raise RuntimeError(f"Could not find an available port for LiveCodes server (tried {port}-{actual_port})")
+                raise RuntimeError(
+                    f"Could not find an available port for LiveCodes server (tried {port}-{actual_port})"
+                )
 
     def _serve():
-        with socketserver.TCPServer(("", actual_port), lambda *a, **k: _CORSRequestHandler(*a, directory=str(build_dir), **k)) as httpd:
+        with socketserver.TCPServer(
+            ("", actual_port),
+            lambda *a, **k: _CORSRequestHandler(*a, directory=str(build_dir), **k),
+        ) as httpd:
             httpd.serve_forever()
 
     thread = threading.Thread(target=_serve, daemon=True, name="livecodes-server")
@@ -645,7 +678,9 @@ def start_livecodes_server(build_dir: Path = LIVECODES_BUILD_DIR, port: int = LI
     return thread, actual_port
 
 
-def livecodes_url(port: int = LIVECODES_PORT, path: str = "", host: str = "127.0.0.2") -> str:
+def livecodes_url(
+    port: int = LIVECODES_PORT, path: str = "", host: str = "127.0.0.2"
+) -> str:
     """
     Build a URL to the local LiveCodes server.
 
@@ -657,6 +692,7 @@ def livecodes_url(port: int = LIVECODES_PORT, path: str = "", host: str = "127.0
 
 
 # ── Ollama helpers ───────────────────────────────────────────────────────────
+
 
 def migrate_ollama_config(d: dict) -> dict:
     """Upgrade a flat ollama config dict to the profile-based format, in place."""
@@ -696,7 +732,9 @@ def parse_ollama_model_params(parameters_str: str) -> dict[str, Any]:
     return result
 
 
-def ollama_generate_payload(prompt: str, model: str = "llama3.2", system: str | None = None) -> dict[str, Any]:
+def ollama_generate_payload(
+    prompt: str, model: str = "llama3.2", system: str | None = None
+) -> dict[str, Any]:
     """
     Build an Ollama /api/generate request payload.
 
@@ -736,6 +774,7 @@ def ollama_chat_payload(
     model: str = "llama3.2",
     system: str | None = None,
     options: dict | None = None,
+    keep_alive: str | None = None,
 ) -> dict[str, Any]:
     """Build an Ollama /api/chat request payload with conversation history."""
     msgs: list[dict[str, str]] = []
@@ -745,52 +784,194 @@ def ollama_chat_payload(
     result: dict[str, Any] = {"model": model, "messages": msgs, "stream": True}
     if options:
         result["options"] = {k: v for k, v in options.items() if v is not None}
+    if keep_alive:
+        result["keep_alive"] = keep_alive
     return result
 
 
 # ── Ollama model parameter spec ───────────────────────────────────────────────
 # Each entry: (key, label, type, default, min, max, step, tooltip)
 OLLAMA_PARAM_GROUPS: list[tuple[str, list[tuple]]] = [
-    ("Sampling", [
-        ("temperature", "Temperature", float, 0.8, 0.0, 2.0, 0.05,
-         "Randomness of output. Lower is more focused; higher is more creative."),
-        ("top_p", "Top P (nucleus)", float, 0.9, 0.0, 1.0, 0.01,
-         "Cumulative probability cutoff for nucleus sampling."),
-        ("top_k", "Top K", int, 40, 0, 500, 1,
-         "Limit sampling to the K most probable tokens. 0 = disabled."),
-        ("min_p", "Min P", float, 0.0, 0.0, 1.0, 0.01,
-         "Minimum probability relative to the top token. Filters out implausible tokens."),
-    ]),
-    ("Repetition", [
-        ("repeat_penalty", "Repeat penalty", float, 1.1, 1.0, 2.0, 0.05,
-         "Penalises recently-used tokens to discourage repetition."),
-        ("repeat_last_n", "Repeat last N", int, 64, -1, 4096, 1,
-         "How far back to scan for repeat penalty. -1 = full context, 0 = off."),
-        ("presence_penalty", "Presence penalty", float, 0.0, -2.0, 2.0, 0.05,
-         "Penalises any token that has appeared at all, regardless of frequency."),
-        ("frequency_penalty", "Frequency penalty", float, 0.0, -2.0, 2.0, 0.05,
-         "Penalises tokens proportionally to how often they've appeared."),
-    ]),
-    ("Context & Length", [
-        ("num_ctx", "Context window", int, 2048, 256, 131072, 256,
-         "Token context window. Larger = better long-context recall but more VRAM."),
-        ("num_predict", "Max tokens", int, -1, -1, 65536, 1,
-         "Maximum tokens to generate. -1 = unlimited."),
-        ("seed", "Seed", int, -1, -1, 2147483647, 1,
-         "Random seed for reproducible output. -1 = random each run."),
-    ]),
-    ("Advanced", [
-        ("tfs_z", "TFS Z", float, 1.0, 0.0, 2.0, 0.05,
-         "Tail-free sampling. Reduces low-probability token noise. 1.0 = off."),
-        ("typical_p", "Typical P", float, 1.0, 0.0, 1.0, 0.01,
-         "Locally-typical sampling. 1.0 = off."),
-        ("mirostat", "Mirostat", int, 0, 0, 2, 1,
-         "Mirostat perplexity control. 0 = off, 1 = v1, 2 = v2 (recommended)."),
-        ("mirostat_tau", "Mirostat tau", float, 5.0, 0.0, 10.0, 0.1,
-         "Target entropy (perplexity) for Mirostat. Higher = more varied output."),
-        ("mirostat_eta", "Mirostat eta", float, 0.1, 0.0, 1.0, 0.01,
-         "Mirostat learning rate — how fast it adjusts."),
-    ]),
+    (
+        "Sampling",
+        [
+            (
+                "temperature",
+                "Temperature",
+                float,
+                0.8,
+                0.0,
+                2.0,
+                0.05,
+                "Randomness of output. Lower is more focused; higher is more creative.",
+            ),
+            (
+                "top_p",
+                "Top P (nucleus)",
+                float,
+                0.9,
+                0.0,
+                1.0,
+                0.01,
+                "Cumulative probability cutoff for nucleus sampling.",
+            ),
+            (
+                "top_k",
+                "Top K",
+                int,
+                40,
+                0,
+                500,
+                1,
+                "Limit sampling to the K most probable tokens. 0 = disabled.",
+            ),
+            (
+                "min_p",
+                "Min P",
+                float,
+                0.0,
+                0.0,
+                1.0,
+                0.01,
+                "Minimum probability relative to the top token. Filters out implausible tokens.",
+            ),
+        ],
+    ),
+    (
+        "Repetition",
+        [
+            (
+                "repeat_penalty",
+                "Repeat penalty",
+                float,
+                1.1,
+                1.0,
+                2.0,
+                0.05,
+                "Penalises recently-used tokens to discourage repetition.",
+            ),
+            (
+                "repeat_last_n",
+                "Repeat last N",
+                int,
+                64,
+                -1,
+                4096,
+                1,
+                "How far back to scan for repeat penalty. -1 = full context, 0 = off.",
+            ),
+            (
+                "presence_penalty",
+                "Presence penalty",
+                float,
+                0.0,
+                -2.0,
+                2.0,
+                0.05,
+                "Penalises any token that has appeared at all, regardless of frequency.",
+            ),
+            (
+                "frequency_penalty",
+                "Frequency penalty",
+                float,
+                0.0,
+                -2.0,
+                2.0,
+                0.05,
+                "Penalises tokens proportionally to how often they've appeared.",
+            ),
+        ],
+    ),
+    (
+        "Context & Length",
+        [
+            (
+                "num_ctx",
+                "Context window",
+                int,
+                2048,
+                256,
+                131072,
+                256,
+                "Token context window. Larger = better long-context recall but more VRAM.",
+            ),
+            (
+                "num_predict",
+                "Max tokens",
+                int,
+                -1,
+                -1,
+                65536,
+                1,
+                "Maximum tokens to generate. -1 = unlimited.",
+            ),
+            (
+                "seed",
+                "Seed",
+                int,
+                -1,
+                -1,
+                2147483647,
+                1,
+                "Random seed for reproducible output. -1 = random each run.",
+            ),
+        ],
+    ),
+    (
+        "Advanced",
+        [
+            (
+                "tfs_z",
+                "TFS Z",
+                float,
+                1.0,
+                0.0,
+                2.0,
+                0.05,
+                "Tail-free sampling. Reduces low-probability token noise. 1.0 = off.",
+            ),
+            (
+                "typical_p",
+                "Typical P",
+                float,
+                1.0,
+                0.0,
+                1.0,
+                0.01,
+                "Locally-typical sampling. 1.0 = off.",
+            ),
+            (
+                "mirostat",
+                "Mirostat",
+                int,
+                0,
+                0,
+                2,
+                1,
+                "Mirostat perplexity control. 0 = off, 1 = v1, 2 = v2 (recommended).",
+            ),
+            (
+                "mirostat_tau",
+                "Mirostat tau",
+                float,
+                5.0,
+                0.0,
+                10.0,
+                0.1,
+                "Target entropy (perplexity) for Mirostat. Higher = more varied output.",
+            ),
+            (
+                "mirostat_eta",
+                "Mirostat eta",
+                float,
+                0.1,
+                0.0,
+                1.0,
+                0.01,
+                "Mirostat learning rate — how fast it adjusts.",
+            ),
+        ],
+    ),
 ]
 
 
@@ -823,7 +1004,7 @@ _CHAT_CSS = (
     "</style>"
 )
 
-_CHAT_DATA_RE = re.compile(r'<!-- scratch-chat-data:([A-Za-z0-9+/=]+) -->')
+_CHAT_DATA_RE = re.compile(r"<!-- scratch-chat-data:([A-Za-z0-9+/=]+) -->")
 
 
 def is_chat_page_html(s: str) -> bool:
@@ -833,6 +1014,7 @@ def is_chat_page_html(s: str) -> bool:
 def parse_chat_page_html(s: str) -> list[dict] | None:
     """Extract the stored message history from a chat page, or None if absent."""
     import base64
+
     m = _CHAT_DATA_RE.search(s)
     if not m:
         return None
@@ -845,13 +1027,37 @@ def parse_chat_page_html(s: str) -> list[dict] | None:
 def chat_page_html(messages: list[dict[str, str]]) -> str:
     """Render a list of chat messages as a styled HTML page."""
     import base64
+
     encoded = base64.b64encode(json.dumps(messages).encode()).decode()
-    parts = [f'<!-- scratch-chat-data:{encoded} -->', _CHAT_CSS]
+    parts = [f"<!-- scratch-chat-data:{encoded} -->", _CHAT_CSS]
     for msg in messages:
         role = msg.get("role", "user")
         cls = "u" if role == "user" else "a"
         label = "You" if role == "user" else "Ollama"
         body = html.escape(msg.get("content", ""))
-        parts.append(f'<div class="turn {cls}"><div class="lbl">{label}</div>'
-                     f'<div class="body">{body}</div></div>')
+        parts.append(
+            f'<div class="turn {cls}"><div class="lbl">{label}</div>'
+            f'<div class="body">{body}</div></div>'
+        )
     return "".join(parts)
+
+
+def reindex_page_map_after_insert(
+    page_map: dict[int, Any], insert_index: int
+) -> dict[int, Any]:
+    """Shift page-indexed values after inserting a page at insert_index."""
+    return {
+        (page_index + 1 if page_index >= insert_index else page_index): value
+        for page_index, value in page_map.items()
+    }
+
+
+def reindex_page_map_after_delete(
+    page_map: dict[int, Any], delete_index: int
+) -> dict[int, Any]:
+    """Shift page-indexed values after deleting a page at delete_index."""
+    return {
+        (page_index - 1 if page_index > delete_index else page_index): value
+        for page_index, value in page_map.items()
+        if page_index != delete_index
+    }

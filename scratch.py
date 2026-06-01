@@ -12,27 +12,60 @@ import socket as _socket
 import struct
 import subprocess
 import sys
-import termios
 import tempfile
+import termios
 import threading
 import time
-import urllib.request
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QSize, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import QCursor, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineSettings
+from PyQt6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMenu, QMessageBox, QPushButton, QRadioButton, QScrollArea,
-    QSizePolicy, QSpacerItem, QSpinBox, QSplitter,
-    QStackedWidget, QSystemTrayIcon, QTabWidget,
-    QTextEdit, QVBoxLayout, QWidget, QInputDialog,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpacerItem,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QSystemTrayIcon,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 from scratch_core import (
@@ -49,12 +82,15 @@ from scratch_core import (
     migrate_ollama_config,
     ollama_chat_payload,
     ollama_chat_stream_chunks,
-    ollama_generate_payload,
     ollama_stream_chunks,
+    page_title_from_config,
+    page_title_from_html,
     parse_chat_page_html,
     parse_ollama_model_params,
     plain_text_from_html,
     preformatted_html,
+    reindex_page_map_after_delete,
+    reindex_page_map_after_insert,
     resize_rect,
     start_livecodes_server,
 )
@@ -73,15 +109,49 @@ def _load_injection_content(inj: dict) -> str:
     return inj.get("content", "")
 
 
-DATA_FILE    = Path.home() / ".scratch-notes" / "notes.json"
-CONFIG_FILE  = Path.home() / ".scratch-notes" / "config.json"
-BACKUP_DIR   = DATA_FILE.parent / "backups"
+def _ollama_request_timeout() -> float | None:
+    """Return Ollama request timeout seconds; 0/none/off disables it."""
+    raw = os.environ.get(OLLAMA_REQUEST_TIMEOUT_ENV, "").strip().lower()
+    if raw in {"0", "none", "off", "false", "disable", "disabled"}:
+        return None
+    if not raw:
+        return DEFAULT_OLLAMA_REQUEST_TIMEOUT
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.0fs",
+            OLLAMA_REQUEST_TIMEOUT_ENV,
+            raw,
+            DEFAULT_OLLAMA_REQUEST_TIMEOUT,
+        )
+        return DEFAULT_OLLAMA_REQUEST_TIMEOUT
+
+
+def _ollama_keep_alive() -> str | None:
+    """Return Ollama keep_alive value; default/omit leaves server default behavior."""
+    raw = os.environ.get(OLLAMA_KEEP_ALIVE_ENV, "").strip()
+    if not raw:
+        return DEFAULT_OLLAMA_KEEP_ALIVE
+    if raw.lower() in {"default", "omit", "none"}:
+        return None
+    return raw
+
+
+DATA_FILE = Path.home() / ".scratch-notes" / "notes.json"
+CONFIG_FILE = Path.home() / ".scratch-notes" / "config.json"
+BACKUP_DIR = DATA_FILE.parent / "backups"
 MAX_NOTE_BACKUPS = 100
-ASSETS_DIR   = Path(__file__).parent / "assets"
-EDITOR_URL   = QUrl.fromLocalFile(str(ASSETS_DIR / "editor.html"))
+ASSETS_DIR = Path(__file__).parent / "assets"
+EDITOR_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "editor.html"))
 LIVECODES_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "livecodes_pane.html"))
 TERMINAL_URL = QUrl.fromLocalFile(str(ASSETS_DIR / "terminal.html"))
-SOCKET_PATH  = f"/tmp/scratch-{os.getuid()}.sock"
+SOCKET_PATH = f"/tmp/scratch-{os.getuid()}.sock"
+
+OLLAMA_REQUEST_TIMEOUT_ENV = "SCRATCH_OLLAMA_TIMEOUT"
+DEFAULT_OLLAMA_REQUEST_TIMEOUT = 300.0
+OLLAMA_KEEP_ALIVE_ENV = "SCRATCH_OLLAMA_KEEP_ALIVE"
+DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
 
 DEFAULT_UI_SETTINGS = {
     "window_color": "#1a1a2e",
@@ -108,7 +178,11 @@ DEFAULT_UI_SETTINGS = {
 
 def _hex_color(value, fallback):
     value = str(value or "").strip()
-    if len(value) == 7 and value[0] == "#" and all(c in "0123456789abcdefABCDEF" for c in value[1:]):
+    if (
+        len(value) == 7
+        and value[0] == "#"
+        and all(c in "0123456789abcdefABCDEF" for c in value[1:])
+    ):
         return value.lower()
     return fallback
 
@@ -138,8 +212,12 @@ def normalized_ui_settings(raw):
     ui["border_radius"] = _bounded_int(ui.get("border_radius"), 8, 0, 24)
     ui["button_radius"] = _bounded_int(ui.get("button_radius"), 5, 0, 14)
     ui["toolbar_padding"] = _bounded_int(ui.get("toolbar_padding"), 6, 0, 18)
-    ui["toolbar_button_spacing"] = _bounded_int(ui.get("toolbar_button_spacing"), 3, 0, 12)
-    ui["toolbar_group_spacing"] = _bounded_int(ui.get("toolbar_group_spacing"), 10, 0, 24)
+    ui["toolbar_button_spacing"] = _bounded_int(
+        ui.get("toolbar_button_spacing"), 3, 0, 12
+    )
+    ui["toolbar_group_spacing"] = _bounded_int(
+        ui.get("toolbar_group_spacing"), 10, 0, 24
+    )
     ui["page_rail_padding"] = _bounded_int(ui.get("page_rail_padding"), 6, 0, 18)
     ui["button_size"] = _bounded_int(ui.get("button_size"), 27, 24, 34)
     ui["button_height"] = _bounded_int(ui.get("button_height"), 25, 22, 32)
@@ -151,7 +229,7 @@ def normalized_ui_settings(raw):
 
 def _hex_to_rgb(value):
     value = _hex_color(value, DEFAULT_UI_SETTINGS["pin_glow_color"])
-    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+    return tuple(int(value[i : i + 2], 16) for i in (1, 3, 5))
 
 
 def style_from_ui(raw):
@@ -192,10 +270,13 @@ QPushButton#del     {{ color: #ff5f6d; }}
 QPushButton#nav     {{ color: #9aacd0; font-size: 14px; background: transparent; border: none; }}
 QPushButton#nav:hover    {{ background: {ui["button_hover"]}; color: #e6edf3; }}
 QPushButton#nav:disabled {{ color: #2d2d4e; background: transparent; }}
-QLabel#page-label {{ color: #9aacd0; font-size: 11px; font-weight: 700; }}
+QPushButton#nav-counter {{ color: #9aacd0; font-size: 11px; font-weight: 700; background: transparent; border: none; }}
+QPushButton#nav-counter:hover {{ color: #e6edf3; background: {ui["button_hover"]}; border-radius: 4px; }}
 """
 
+
 # ── single-instance ──────────────────────────────────────────────────────────
+
 
 def _acquire_instance_lock():
     """
@@ -226,6 +307,7 @@ def _acquire_instance_lock():
 
 def _start_instance_listener(lock_sock, on_show):
     """Background thread: accept show-signals from future invocations."""
+
     def _run():
         while True:
             try:
@@ -236,29 +318,34 @@ def _start_instance_listener(lock_sock, on_show):
                     on_show()
             except OSError:
                 break
+
     threading.Thread(target=_run, daemon=True).start()
 
 
 # ── PTY ─────────────────────────────────────────────────────────────────────
 
+
 class PtyManager:
     """Manages a pseudo-terminal (PTY) subprocess with asynchronous I/O."""
+
     def __init__(self, on_data, on_exit):
-        self._on_data   = on_data
-        self._on_exit   = on_exit
+        self._on_data = on_data
+        self._on_exit = on_exit
         self._master_fd = None
-        self._pid       = None
-        self._thread    = None
+        self._pid = None
+        self._thread = None
 
     def start(self, cwd=None):
         self.stop()
         shell = os.environ.get("SHELL", "/bin/bash")
-        env   = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor"}
+        env = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor"}
         pid, master_fd = pty.fork()
         if pid == 0:
             if cwd:
-                try: os.chdir(cwd)
-                except OSError: pass
+                try:
+                    os.chdir(cwd)
+                except OSError:
+                    pass
             os.execvpe(shell, [shell], env)
         self._pid, self._master_fd = pid, master_fd
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -276,15 +363,21 @@ class PtyManager:
 
     def write(self, data):
         if self._master_fd is not None:
-            try: os.write(self._master_fd, data.encode())
-            except OSError: pass
+            try:
+                os.write(self._master_fd, data.encode())
+            except OSError:
+                pass
 
     def resize(self, cols, rows):
         if self._master_fd is not None:
             try:
-                fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ,
-                            struct.pack("HHHH", rows, cols, 0, 0))
-            except OSError: pass
+                fcntl.ioctl(
+                    self._master_fd,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0),
+                )
+            except OSError:
+                pass
 
     def stop(self):
         if self._pid:
@@ -304,8 +397,10 @@ class PtyManager:
 
 # ── bridges ──────────────────────────────────────────────────────────────────
 
+
 class QuillBridge(QObject):
     """Bridge exposing Qt slots for Quill editor events to Python."""
+
     def __init__(self, pane):
         super().__init__()
         self._pane = pane
@@ -325,8 +420,12 @@ class QuillBridge(QObject):
         self._pane._edit_mode = True
         self._pane.view.setFocus(Qt.FocusReason.OtherFocusReason)
         self._pane._pad._sync_command_states()
-        QTimer.singleShot(0, lambda: self._pane.view.page().runJavaScript("focusEditor()"))
-        QTimer.singleShot(80, lambda: self._pane.view.page().runJavaScript("focusEditor()"))
+        QTimer.singleShot(
+            0, lambda: self._pane.view.page().runJavaScript("focusEditor()")
+        )
+        QTimer.singleShot(
+            80, lambda: self._pane.view.page().runJavaScript("focusEditor()")
+        )
 
     @pyqtSlot()
     def snapshotDone(self):
@@ -339,9 +438,10 @@ class QuillBridge(QObject):
 
 class TerminalBridge(QObject):
     """Bridge exposing Qt slots for terminal I/O between Python PTY and JS."""
+
     terminalOutputSignal = pyqtSignal(str)
-    cwdSignal            = pyqtSignal(str)
-    fitSignal            = pyqtSignal()
+    cwdSignal = pyqtSignal(str)
+    fitSignal = pyqtSignal()
 
     def __init__(self, window):
         super().__init__()
@@ -370,39 +470,51 @@ class TerminalBridge(QObject):
 
 # ── Quill pane ───────────────────────────────────────────────────────────────
 
+
 class QuillPane(QWidget):
     """Container pane hosting the LiveCodes-backed editor/preview."""
+
     content_changed = pyqtSignal(int, str)
 
-    chat_message_sent     = pyqtSignal(int, str)  # page_index, text
-    page_loaded           = pyqtSignal(int)        # page_index
-    restore_history_requested = pyqtSignal(int)    # page_index
+    chat_message_sent = pyqtSignal(int, str)  # page_index, text
+    page_loaded = pyqtSignal(int)  # page_index
+    restore_history_requested = pyqtSignal(int)  # page_index
+
+    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     def __init__(self, pad, initial_page=0):
         super().__init__()
-        self._pad          = pad
-        self._page_index   = initial_page
+        self._pad = pad
+        self._page_index = initial_page
         self._editor_ready = False
         self._pending_html = None
-        self._edit_mode    = False
+        self._edit_mode = False
+        self._chat_state = "idle"  # idle | connecting | streaming
+        self._spinner_frame = 0
 
         self._snapshot_callback = None
         self._snapshot_fallback = QTimer(self)
         self._snapshot_fallback.setSingleShot(True)
         self._snapshot_fallback.timeout.connect(self._on_snapshot_done)
 
-        self.bridge  = QuillBridge(self)
+        self.bridge = QuillBridge(self)
         self.channel = QWebChannel(self)
         self.channel.registerObject("bridge", self.bridge)
         self.view = QWebEngineView(self)
         self.view.setMinimumSize(QSize(0, 0))
         s = self.view.settings()
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        s.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
+        )
+        s.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+        )
         self.view.page().setWebChannel(self.channel)
         self._install_context_menu_bridge()
         livecodes_url_obj = QUrl(LIVECODES_URL)
-        livecodes_url_obj.setQuery(urllib.parse.urlencode({"appUrl": self._pad.livecodes_app_url}))
+        livecodes_url_obj.setQuery(
+            urllib.parse.urlencode({"appUrl": self._pad.livecodes_app_url})
+        )
         self.view.setUrl(livecodes_url_obj)
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.view.installEventFilter(self)
@@ -417,8 +529,8 @@ class QuillPane(QWidget):
         self._chat_view.loadFinished.connect(self._on_chat_view_ready)
 
         self._view_stack = QStackedWidget(self)
-        self._view_stack.addWidget(self.view)       # index 0 — LiveCodes
-        self._view_stack.addWidget(self._chat_view) # index 1 — AI chat
+        self._view_stack.addWidget(self.view)  # index 0 — LiveCodes
+        self._view_stack.addWidget(self._chat_view)  # index 1 — AI chat
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -430,14 +542,17 @@ class QuillPane(QWidget):
         chat_hl.setSpacing(6)
         self._chat_input = QTextEdit(self._chat_bar)
         self._chat_input.setMaximumHeight(58)
-        self._chat_input.setPlaceholderText("Reply to Ollama… (Enter to send, Shift+Enter for newline)")
+        self._chat_input.setPlaceholderText(
+            "Reply to Ollama… (Enter to send, Shift+Enter for newline)"
+        )
         self._chat_input.installEventFilter(self)
         self._send_btn = QPushButton("Send", self._chat_bar)
         self._send_btn.setFixedWidth(56)
         self._send_btn.clicked.connect(self._on_chat_send)
         self._restore_btn = QPushButton("Restore history", self._chat_bar)
         self._restore_btn.clicked.connect(
-            lambda: self.restore_history_requested.emit(self._page_index))
+            lambda: self.restore_history_requested.emit(self._page_index)
+        )
         self._restore_btn.hide()
         chat_hl.addWidget(self._restore_btn)
         chat_hl.addWidget(self._chat_input, 1)
@@ -474,7 +589,10 @@ class QuillPane(QWidget):
                 allow_empty = bool(payload.get("allowEmpty"))
                 payload = payload.get("config", {})
                 if not is_livecodes_content_config(payload):
-                    logger.warning("Ignored invalid LiveCodes save payload for page %s", target_page + 1)
+                    logger.warning(
+                        "Ignored invalid LiveCodes save payload for page %s",
+                        target_page + 1,
+                    )
                     return
                 source = livecodes_source_from_config(payload)
             elif is_livecodes_content_config(payload):
@@ -487,7 +605,9 @@ class QuillPane(QWidget):
             return
         current_source = self._pad.notes["pages"][target_page]
         if source == "" and current_source.strip() and not allow_empty:
-            logger.warning("Ignored empty LiveCodes save over non-empty page %s", target_page + 1)
+            logger.warning(
+                "Ignored empty LiveCodes save over non-empty page %s", target_page + 1
+            )
             return
         self._pad.notes["pages"][target_page] = source
         self._pad.schedule_save()
@@ -496,18 +616,23 @@ class QuillPane(QWidget):
     def _send_content(self, source):
         config = livecodes_config_from_source(source)
         self.view.page().runJavaScript(
-            f"loadNoteSource({json.dumps(source)}, {json.dumps(json.dumps(config))}, {self._page_index})")
+            f"loadNoteSource({json.dumps(source)}, {json.dumps(json.dumps(config))}, {self._page_index})"
+        )
 
     def capture_current_content(self):
         if self._editor_ready:
-            self.view.page().runJavaScript(f"captureLiveCodesConfig({self._page_index})")
+            self.view.page().runJavaScript(
+                f"captureLiveCodesConfig({self._page_index})"
+            )
 
     def capture_and_then(self, callback, fallback_ms=500):
         """Capture editor content, then invoke callback once JS confirms done (or timeout)."""
         self._snapshot_callback = callback
         self._snapshot_fallback.start(fallback_ms)
         if self._editor_ready:
-            self.view.page().runJavaScript(f"captureLiveCodesConfig({self._page_index})")
+            self.view.page().runJavaScript(
+                f"captureLiveCodesConfig({self._page_index})"
+            )
         else:
             self._on_snapshot_done()
 
@@ -539,6 +664,10 @@ class QuillPane(QWidget):
         script.setRunsOnSubFrames(True)
         script.setSourceCode(
             """
+            var _scratchFocused = null;
+            document.addEventListener('focusin', function(e) {
+                _scratchFocused = e.target;
+            }, true);
             document.addEventListener('contextmenu', function(event) {
                 event.preventDefault();
                 event.stopPropagation();
@@ -548,7 +677,11 @@ class QuillPane(QWidget):
             window.addEventListener('message', function(event) {
                 var data = event.data || {};
                 if (data.type !== 'scratch-edit-command' || !data.command) return;
+                if (_scratchFocused) { try { _scratchFocused.focus(); } catch(e) {} }
                 document.execCommand(data.command);
+                for (var i = 0; i < window.frames.length; i++) {
+                    try { window.frames[i].postMessage(data, '*'); } catch(e) {}
+                }
             });
             """
         )
@@ -571,6 +704,42 @@ class QuillPane(QWidget):
         self._restore_btn.hide()
         self._chat_input.setEnabled(True)
         self._send_btn.setEnabled(True)
+
+    def set_connecting(self):
+        self._chat_state = "connecting"
+        self._chat_input.setEnabled(False)
+        self._send_btn.setEnabled(False)
+        self._start_spinner()
+
+    def set_streaming(self):
+        self._chat_state = "streaming"
+        self._stop_spinner()
+        self._send_btn.setText("●")
+
+    def set_idle(self):
+        self._chat_state = "idle"
+        self._stop_spinner()
+        self._send_btn.setText("Send")
+        self._send_btn.setEnabled(True)
+        self._chat_input.setEnabled(True)
+
+    def _start_spinner(self):
+        self._spinner_frame = 0
+        if not hasattr(self, "_spinner_timer"):
+            self._spinner_timer = QTimer(self)
+            self._spinner_timer.timeout.connect(self._tick_spinner)
+        self._spinner_timer.start(80)
+        self._tick_spinner()
+
+    def _stop_spinner(self):
+        if hasattr(self, "_spinner_timer"):
+            self._spinner_timer.stop()
+
+    def _tick_spinner(self):
+        self._send_btn.setText(
+            self._SPINNER_FRAMES[self._spinner_frame % len(self._SPINNER_FRAMES)]
+        )
+        self._spinner_frame += 1
 
     def _on_chat_view_ready(self, ok: bool):
         self._chat_view_ready = True
@@ -608,8 +777,9 @@ class QuillPane(QWidget):
 
     def eventFilter(self, obj, event):
         if obj is self._chat_input and event.type() == QEvent.Type.KeyPress:
-            if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                    and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            ):
                 self._on_chat_send()
                 return True
         if obj is self.view and event.type() == QEvent.Type.MouseButtonPress:
@@ -622,14 +792,15 @@ class QuillPane(QWidget):
 
     def set_edit_mode(self, enabled):
         self._edit_mode = bool(enabled)
-        self.view.page().runJavaScript(
-            f"setEditMode({json.dumps(self._edit_mode)})")
+        self.view.page().runJavaScript(f"setEditMode({json.dumps(self._edit_mode)})")
 
 
 # ── drag handle ──────────────────────────────────────────────────────────────
 
+
 class DragHandle(QFrame):
     """Draggable top bar for moving the frameless window."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._drag_pos = None
@@ -637,8 +808,9 @@ class DragHandle(QFrame):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = (e.globalPosition().toPoint()
-                              - self.window().frameGeometry().topLeft())
+            self._drag_pos = (
+                e.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+            )
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             e.accept()
 
@@ -653,7 +825,9 @@ class DragHandle(QFrame):
         e.accept()
 
     def mouseDoubleClickEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and hasattr(self.window(), "_toggle_pin"):
+        if e.button() == Qt.MouseButton.LeftButton and hasattr(
+            self.window(), "_toggle_pin"
+        ):
             self.window()._toggle_pin()
 
 
@@ -750,7 +924,9 @@ class OllamaPromptDialog(QDialog):
             "e.g. Summarize this, fix the bugs, explain this code, translate to Spanish…"
         )
         root.addWidget(self.text, 1)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
@@ -826,13 +1002,18 @@ class InjectionEditDialog(QDialog):
         root.addWidget(help_lbl)
 
         btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
-        (self._rb_file if item.get("type", "file") == "file" else self._rb_text).setChecked(True)
-        (self._rb_system if item.get("role", "system") == "system" else self._rb_user).setChecked(True)
+        (
+            self._rb_file if item.get("type", "file") == "file" else self._rb_text
+        ).setChecked(True)
+        (
+            self._rb_system if item.get("role", "system") == "system" else self._rb_user
+        ).setChecked(True)
         self._rb_file.toggled.connect(self._on_type_changed)
         self._on_type_changed()
 
@@ -852,7 +1033,8 @@ class InjectionEditDialog(QDialog):
     def value(self) -> dict:
         typ = "file" if self._rb_file.isChecked() else "text"
         d = {
-            "label": self._label.text().strip() or (self._path.text().split("/")[-1] if typ == "file" else "text"),
+            "label": self._label.text().strip()
+            or (self._path.text().split("/")[-1] if typ == "file" else "text"),
             "type": typ,
             "role": "system" if self._rb_system.isChecked() else "user",
         }
@@ -1052,8 +1234,14 @@ class _HelpPopup(QFrame):
 class OllamaParamsDialog(QDialog):
     """Advanced Ollama generation parameters and context injection editor."""
 
-    def __init__(self, parent, model_params: dict, injections: list,
-                 base_url: str = "http://localhost:11434", model: str = ""):
+    def __init__(
+        self,
+        parent,
+        model_params: dict,
+        injections: list,
+        base_url: str = "http://localhost:11434",
+        model: str = "",
+    ):
         super().__init__(parent)
         self.setWindowTitle("Model parameters")
         self.resize(500, 580)
@@ -1078,7 +1266,9 @@ class OllamaParamsDialog(QDialog):
         self._param_rows: dict[str, tuple] = {}  # key → (checkbox, spinbox)
         for section, params in OLLAMA_PARAM_GROUPS:
             hdr = QLabel(section)
-            hdr.setStyleSheet("font-weight: bold; padding-top: 10px; padding-bottom: 2px;")
+            hdr.setStyleSheet(
+                "font-weight: bold; padding-top: 10px; padding-bottom: 2px;"
+            )
             gen_vbox.addWidget(hdr)
             form = QFormLayout()
             form.setContentsMargins(0, 0, 0, 4)
@@ -1116,7 +1306,9 @@ class OllamaParamsDialog(QDialog):
                 )
                 help_text = _OLLAMA_PARAM_HELP.get(key, tip)
                 help_btn.clicked.connect(
-                    lambda _checked, btn=help_btn, txt=help_text: self._show_help(btn, txt)
+                    lambda _checked, btn=help_btn, txt=help_text: self._show_help(
+                        btn, txt
+                    )
                 )
                 row_hl.addWidget(cb)
                 row_hl.addWidget(sb)
@@ -1129,8 +1321,12 @@ class OllamaParamsDialog(QDialog):
         gen_scroll.setWidget(gen_container)
         reset_btn = QPushButton("Reset all to model defaults")
         reset_btn.clicked.connect(self._reset_all)
-        load_btn = QPushButton(f"Load from model{': ' + self._model if self._model else ''}…")
-        load_btn.setToolTip("Fetch the model's built-in recommended parameters from Ollama")
+        load_btn = QPushButton(
+            f"Load from model{': ' + self._model if self._model else ''}…"
+        )
+        load_btn.setToolTip(
+            "Fetch the model's built-in recommended parameters from Ollama"
+        )
         load_btn.clicked.connect(self._load_from_model)
         gen_root = QVBoxLayout(gen_tab)
         gen_root.setContentsMargins(0, 0, 0, 0)
@@ -1175,7 +1371,8 @@ class OllamaParamsDialog(QDialog):
         tabs.addTab(inj_tab, "Injection")
 
         btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
@@ -1186,6 +1383,7 @@ class OllamaParamsDialog(QDialog):
             return
         try:
             import urllib.request as _ur
+
             req = _ur.Request(
                 f"{self._base_url}/api/show",
                 data=json.dumps({"name": self._model}).encode(),
@@ -1196,11 +1394,16 @@ class OllamaParamsDialog(QDialog):
                 data = json.loads(resp.read())
             params_str = data.get("parameters", "")
         except Exception as e:
-            QMessageBox.warning(self, "Load from model", f"Could not fetch model info:\n{e}")
+            QMessageBox.warning(
+                self, "Load from model", f"Could not fetch model info:\n{e}"
+            )
             return
         if not params_str:
-            QMessageBox.information(self, "Load from model",
-                                    f"{self._model} has no built-in parameters defined.")
+            QMessageBox.information(
+                self,
+                "Load from model",
+                f"{self._model} has no built-in parameters defined.",
+            )
             return
         suggested = parse_ollama_model_params(params_str)
         applied = 0
@@ -1215,16 +1418,22 @@ class OllamaParamsDialog(QDialog):
             except Exception:
                 pass
         if applied:
-            QMessageBox.information(self, "Load from model",
-                                    f"Applied {applied} parameter(s) from {self._model}.\n"
-                                    "Review the checked values and uncheck any you don't want.")
+            QMessageBox.information(
+                self,
+                "Load from model",
+                f"Applied {applied} parameter(s) from {self._model}.\n"
+                "Review the checked values and uncheck any you don't want.",
+            )
         else:
-            QMessageBox.information(self, "Load from model",
-                                    f"No matching parameters found in {self._model}'s definition.")
+            QMessageBox.information(
+                self,
+                "Load from model",
+                f"No matching parameters found in {self._model}'s definition.",
+            )
 
     def _show_help(self, btn: QPushButton, text: str):
-        popup = _HelpPopup(text)
-        popup.show_near(btn.mapToGlobal(QPoint(0, btn.height())))
+        self._help_popup = _HelpPopup(text)
+        self._help_popup.show_near(btn.mapToGlobal(QPoint(0, btn.height())))
 
     def _reset_all(self):
         for cb, _ in self._param_rows.values():
@@ -1322,37 +1531,51 @@ class ShareTargetDialog(QDialog):
         path_layout.addWidget(browse_btn)
         self.lf_format = QComboBox()
         self.lf_format.addItems(self.FORMATS)
-        self.lf_format.setCurrentText(target.get("format", "html") if kind == "local_folder" else "html")
+        self.lf_format.setCurrentText(
+            target.get("format", "html") if kind == "local_folder" else "html"
+        )
         f.addRow("Folder path", path_row)
         f.addRow("File format", self.lf_format)
 
         # scp
         f = _panel("scp")
-        self.scp_dest = QLineEdit(target.get("destination", "") if kind == "scp" else "")
+        self.scp_dest = QLineEdit(
+            target.get("destination", "") if kind == "scp" else ""
+        )
         self.scp_dest.setPlaceholderText("nova:/home/ash/inbox/")
         self.scp_format = QComboBox()
         self.scp_format.addItems(self.FORMATS)
-        self.scp_format.setCurrentText(target.get("format", "html") if kind == "scp" else "html")
+        self.scp_format.setCurrentText(
+            target.get("format", "html") if kind == "scp" else "html"
+        )
         f.addRow("Destination", self.scp_dest)
         f.addRow("File format", self.scp_format)
 
         # sftp
         f = _panel("sftp")
-        self.sftp_dest = QLineEdit(target.get("destination", "") if kind == "sftp" else "")
+        self.sftp_dest = QLineEdit(
+            target.get("destination", "") if kind == "sftp" else ""
+        )
         self.sftp_dest.setPlaceholderText("user@host:/path/to/folder/")
         self.sftp_format = QComboBox()
         self.sftp_format.addItems(self.FORMATS)
-        self.sftp_format.setCurrentText(target.get("format", "html") if kind == "sftp" else "html")
+        self.sftp_format.setCurrentText(
+            target.get("format", "html") if kind == "sftp" else "html"
+        )
         f.addRow("Destination", self.sftp_dest)
         f.addRow("File format", self.sftp_format)
 
         # taildrop
         f = _panel("taildrop")
-        self.td_device = QLineEdit(target.get("device", "") if kind == "taildrop" else "")
+        self.td_device = QLineEdit(
+            target.get("device", "") if kind == "taildrop" else ""
+        )
         self.td_device.setPlaceholderText("atlas  (Tailscale device name)")
         self.td_format = QComboBox()
         self.td_format.addItems(self.FORMATS)
-        self.td_format.setCurrentText(target.get("format", "html") if kind == "taildrop" else "html")
+        self.td_format.setCurrentText(
+            target.get("format", "html") if kind == "taildrop" else "html"
+        )
         f.addRow("Device name", self.td_device)
         f.addRow("File format", self.td_format)
 
@@ -1372,23 +1595,33 @@ class ShareTargetDialog(QDialog):
         if isinstance(raw_cmd, list):
             raw_cmd = shlex.join(raw_cmd)
         self.cmd_command = QLineEdit(raw_cmd)
-        self.cmd_command.setPlaceholderText("xclip -selection clipboard   (use {file} or {text})")
+        self.cmd_command.setPlaceholderText(
+            "xclip -selection clipboard   (use {file} or {text})"
+        )
         self.cmd_format = QComboBox()
         self.cmd_format.addItems(self.FORMATS)
-        self.cmd_format.setCurrentText(target.get("format", "html") if kind == "command" else "html")
+        self.cmd_format.setCurrentText(
+            target.get("format", "html") if kind == "command" else "html"
+        )
         f.addRow("Command", self.cmd_command)
         f.addRow("File format", self.cmd_format)
 
         # telegram (extra chat as share target)
         f = _panel("telegram")
-        self.tg_chat_id = QLineEdit(str(target.get("chat_id", "")) if kind == "telegram" else "")
-        self.tg_chat_id.setPlaceholderText("numeric chat ID — find it in the Telegram tab")
+        self.tg_chat_id = QLineEdit(
+            str(target.get("chat_id", "")) if kind == "telegram" else ""
+        )
+        self.tg_chat_id.setPlaceholderText(
+            "numeric chat ID — find it in the Telegram tab"
+        )
         f.addRow("Chat ID", self.tg_chat_id)
 
         self.kind_combo.currentTextChanged.connect(self._on_kind_changed)
         self._on_kind_changed(self.kind_combo.currentText())
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -1449,24 +1682,26 @@ class ConfigDialog(QDialog):
         telegram = config.get("telegram", {})
         tg_tab = QWidget(self)
         tg_root = QVBoxLayout(tg_tab)
-        tg_root.addLayout(self._help_header(
-            "Telegram setup",
-            "Setting up Telegram sharing:\n\n"
-            "1. Open Telegram and chat with @BotFather.\n"
-            "2. Send /newbot and follow the prompts — you'll receive a bot token.\n"
-            "3. Paste the token in 'Bot token' below.\n"
-            "4. Send any message to your new bot (or add it to a group/channel).\n"
-            "   For a channel: add the bot as an admin, then post something.\n"
-            "5. Click 'Fetch recent chats' — discovered chat IDs appear in the list.\n"
-            "6. Click a chat in the list to set it as the default.\n\n"
-            "Why does 'Fetch recent chats' return 0 results?\n"
-            "• getUpdates only sees messages sent TO the bot since it was last polled.\n"
-            "  Send the bot a message first, then fetch.\n"
-            "• If you have a webhook set on this bot token, getUpdates always returns\n"
-            "  empty — webhooks and polling are mutually exclusive in the Bot API.\n"
-            "  Delete the webhook with: api.telegram.org/bot<TOKEN>/deleteWebhook\n\n"
-            "You can always type a chat ID directly — use @userinfobot to find your own."
-        ))
+        tg_root.addLayout(
+            self._help_header(
+                "Telegram setup",
+                "Setting up Telegram sharing:\n\n"
+                "1. Open Telegram and chat with @BotFather.\n"
+                "2. Send /newbot and follow the prompts — you'll receive a bot token.\n"
+                "3. Paste the token in 'Bot token' below.\n"
+                "4. Send any message to your new bot (or add it to a group/channel).\n"
+                "   For a channel: add the bot as an admin, then post something.\n"
+                "5. Click 'Fetch recent chats' — discovered chat IDs appear in the list.\n"
+                "6. Click a chat in the list to set it as the default.\n\n"
+                "Why does 'Fetch recent chats' return 0 results?\n"
+                "• getUpdates only sees messages sent TO the bot since it was last polled.\n"
+                "  Send the bot a message first, then fetch.\n"
+                "• If you have a webhook set on this bot token, getUpdates always returns\n"
+                "  empty — webhooks and polling are mutually exclusive in the Bot API.\n"
+                "  Delete the webhook with: api.telegram.org/bot<TOKEN>/deleteWebhook\n\n"
+                "You can always type a chat ID directly — use @userinfobot to find your own.",
+            )
+        )
         tg_form = QFormLayout()
         tg_root.addLayout(tg_form)
         self.telegram_token = QLineEdit(telegram.get("bot_token", ""))
@@ -1481,7 +1716,9 @@ class ConfigDialog(QDialog):
             label = chat.get("title") or chat.get("username") or str(chat.get("id", ""))
             self.telegram_recent.addItem(f"{label} :: {chat.get('id', '')}")
         self.telegram_recent.itemClicked.connect(
-            lambda item: self.telegram_chat.setText(item.text().rsplit("::", 1)[-1].strip())
+            lambda item: self.telegram_chat.setText(
+                item.text().rsplit("::", 1)[-1].strip()
+            )
         )
         refresh_btn = QPushButton("Fetch recent chats")
         refresh_btn.clicked.connect(self._fetch_recent_chats)
@@ -1493,9 +1730,18 @@ class ConfigDialog(QDialog):
         tabs.addTab(tg_tab, "Telegram")
 
         ollama = migrate_ollama_config(config.get("ollama", {}))
-        self._profiles: list[dict] = list(ollama.get("profiles") or [
-            {"name": "Default", "model": "llama3.2", "system": "", "model_params": {}, "context_injections": []}
-        ])
+        self._profiles: list[dict] = list(
+            ollama.get("profiles")
+            or [
+                {
+                    "name": "Default",
+                    "model": "llama3.2",
+                    "system": "",
+                    "model_params": {},
+                    "context_injections": [],
+                }
+            ]
+        )
         active_name = ollama.get("active_profile", "")
         self._active_profile_idx = next(
             (i for i, p in enumerate(self._profiles) if p.get("name") == active_name), 0
@@ -1505,19 +1751,23 @@ class ConfigDialog(QDialog):
 
         ollama_tab = QWidget(self)
         ollama_root = QVBoxLayout(ollama_tab)
-        ollama_root.addLayout(self._help_header(
-            "Ollama setup",
-            "1. Install Ollama (ollama.com) and start the service.\n"
-            "2. Pull a model:  ollama pull mistral\n"
-            "3. Set the base URL and click Test.\n"
-            "4. Use Profiles to save different model+prompt+parameter combinations.\n"
-            "   Select a profile in 'Ask Ollama' to switch mid-session."
-        ))
+        ollama_root.addLayout(
+            self._help_header(
+                "Ollama setup",
+                "1. Install Ollama (ollama.com) and start the service.\n"
+                "2. Pull a model:  ollama pull mistral\n"
+                "3. Set the base URL and click Test.\n"
+                "4. Use Profiles to save different model+prompt+parameter combinations.\n"
+                "   Select a profile in 'Ask Ollama' to switch mid-session.",
+            )
+        )
 
         # ── global settings ───────────────────────────────────────────────────
         global_form = QFormLayout()
         ollama_root.addLayout(global_form)
-        self.ollama_base_url = QLineEdit(ollama.get("base_url", "http://localhost:11434"))
+        self.ollama_base_url = QLineEdit(
+            ollama.get("base_url", "http://localhost:11434")
+        )
         url_row = QWidget()
         url_hl = QHBoxLayout(url_row)
         url_hl.setContentsMargins(0, 0, 0, 0)
@@ -1546,14 +1796,19 @@ class ConfigDialog(QDialog):
         for p in self._profiles:
             self._profile_combo.addItem(p.get("name", "?"))
         self._profile_combo.setCurrentIndex(self._active_profile_idx)
-        add_p = QPushButton("Add…");    add_p.setFixedWidth(54)
-        ren_p = QPushButton("Rename…"); ren_p.setFixedWidth(70)
-        del_p = QPushButton("Delete");  del_p.setFixedWidth(54)
+        add_p = QPushButton("Add…")
+        add_p.setFixedWidth(54)
+        ren_p = QPushButton("Rename…")
+        ren_p.setFixedWidth(70)
+        del_p = QPushButton("Delete")
+        del_p.setFixedWidth(54)
         add_p.clicked.connect(self._add_profile)
         ren_p.clicked.connect(self._rename_profile)
         del_p.clicked.connect(self._delete_profile)
         prof_hl.addWidget(self._profile_combo, 1)
-        prof_hl.addWidget(add_p); prof_hl.addWidget(ren_p); prof_hl.addWidget(del_p)
+        prof_hl.addWidget(add_p)
+        prof_hl.addWidget(ren_p)
+        prof_hl.addWidget(del_p)
         ollama_root.addWidget(prof_row)
 
         # ── per-profile settings ──────────────────────────────────────────────
@@ -1609,7 +1864,8 @@ class ConfigDialog(QDialog):
         tabs.addTab(targets_tab, "Share targets")
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -1653,7 +1909,8 @@ class ConfigDialog(QDialog):
         row = self._targets_list.currentRow()
         if row > 0:
             self._targets_data[row - 1], self._targets_data[row] = (
-                self._targets_data[row], self._targets_data[row - 1]
+                self._targets_data[row],
+                self._targets_data[row - 1],
             )
             self._refresh_targets_list()
             self._targets_list.setCurrentRow(row - 1)
@@ -1662,7 +1919,8 @@ class ConfigDialog(QDialog):
         row = self._targets_list.currentRow()
         if 0 <= row < len(self._targets_data) - 1:
             self._targets_data[row + 1], self._targets_data[row] = (
-                self._targets_data[row], self._targets_data[row + 1]
+                self._targets_data[row],
+                self._targets_data[row + 1],
             )
             self._refresh_targets_list()
             self._targets_list.setCurrentRow(row + 1)
@@ -1718,10 +1976,17 @@ class ConfigDialog(QDialog):
             QMessageBox.warning(self, "Profile", f"'{name}' already exists.")
             return
         self._save_current_profile()
-        reply = QMessageBox.question(self, "Add profile", "Copy current profile as starting point?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        new_p = dict(self._profiles[self._active_profile_idx]) if reply == QMessageBox.StandardButton.Yes \
+        reply = QMessageBox.question(
+            self,
+            "Add profile",
+            "Copy current profile as starting point?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        new_p = (
+            dict(self._profiles[self._active_profile_idx])
+            if reply == QMessageBox.StandardButton.Yes
             else {"model_params": {}, "context_injections": []}
+        )
         new_p["name"] = name
         self._profiles.append(new_p)
         self._profile_combo.blockSignals(True)
@@ -1749,9 +2014,15 @@ class ConfigDialog(QDialog):
             return
         idx = self._profile_combo.currentIndex()
         name = self._profiles[idx].get("name", "?")
-        if QMessageBox.question(self, "Delete profile", f"Delete '{name}'?",
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                                ) != QMessageBox.StandardButton.Yes:
+        if (
+            QMessageBox.question(
+                self,
+                "Delete profile",
+                f"Delete '{name}'?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
             return
         self._profiles.pop(idx)
         self._profile_combo.blockSignals(True)
@@ -1764,14 +2035,21 @@ class ConfigDialog(QDialog):
     def _open_ollama_params(self):
         base_url = self.ollama_base_url.text().strip() or "http://localhost:11434"
         model = self.ollama_model.currentText().strip()
-        dlg = OllamaParamsDialog(self, self._ollama_model_params, self._ollama_injections,
-                                 base_url=base_url, model=model)
+        dlg = OllamaParamsDialog(
+            self,
+            self._ollama_model_params,
+            self._ollama_injections,
+            base_url=base_url,
+            model=model,
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._ollama_model_params = dlg.model_params()
             self._ollama_injections = dlg.injections()
 
     def _test_ollama(self):
-        base_url = (self.ollama_base_url.text().strip() or "http://localhost:11434").rstrip("/")
+        base_url = (
+            self.ollama_base_url.text().strip() or "http://localhost:11434"
+        ).rstrip("/")
         try:
             with urllib.request.urlopen(f"{base_url}/api/version", timeout=8) as resp:
                 data = json.loads(resp.read().decode())
@@ -1781,7 +2059,9 @@ class ConfigDialog(QDialog):
             QMessageBox.warning(self, "Ollama", f"Could not reach {base_url}:\n{e}")
 
     def _fetch_ollama_models(self):
-        base_url = (self.ollama_base_url.text().strip() or "http://localhost:11434").rstrip("/")
+        base_url = (
+            self.ollama_base_url.text().strip() or "http://localhost:11434"
+        ).rstrip("/")
         try:
             with urllib.request.urlopen(f"{base_url}/api/tags", timeout=8) as resp:
                 data = json.loads(resp.read().decode())
@@ -1791,8 +2071,9 @@ class ConfigDialog(QDialog):
             return
         if not models:
             QMessageBox.information(
-                self, "Ollama models",
-                "No models found. Pull one first:\n  ollama pull mistral"
+                self,
+                "Ollama models",
+                "No models found. Pull one first:\n  ollama pull mistral",
             )
             return
         current = self.ollama_model.currentText()
@@ -1819,7 +2100,8 @@ class ConfigDialog(QDialog):
                     continue
                 chats[str(chat_id)] = {
                     "id": chat_id,
-                    "title": chat.get("title") or " ".join(
+                    "title": chat.get("title")
+                    or " ".join(
                         p for p in [chat.get("first_name"), chat.get("last_name")] if p
                     ),
                     "username": chat.get("username", ""),
@@ -1828,7 +2110,9 @@ class ConfigDialog(QDialog):
             for chat in chats.values():
                 label = chat.get("title") or chat.get("username") or str(chat.get("id"))
                 self.telegram_recent.addItem(f"{label} :: {chat.get('id')}")
-            QMessageBox.information(self, "Telegram", f"Loaded {len(chats)} recent chats.")
+            QMessageBox.information(
+                self, "Telegram", f"Loaded {len(chats)} recent chats."
+            )
         except Exception as e:
             QMessageBox.warning(self, "Telegram", f"Could not fetch chats:\n{e}")
 
@@ -1852,8 +2136,11 @@ class ConfigDialog(QDialog):
                 "recent_chats": recent,
             },
             "ollama": {
-                "base_url": self.ollama_base_url.text().strip() or "http://localhost:11434",
-                "active_profile": self._profiles[self._active_profile_idx].get("name") if self._profiles else "Default",
+                "base_url": self.ollama_base_url.text().strip()
+                or "http://localhost:11434",
+                "active_profile": self._profiles[self._active_profile_idx].get("name")
+                if self._profiles
+                else "Default",
                 "profiles": self._profiles,
             },
             "share_targets": share_targets,
@@ -1898,9 +2185,15 @@ class UiSettingsDialog(QDialog):
         self.border_radius = int_row("Window radius", "border_radius", 0, 24)
         self.button_radius = int_row("Button radius", "button_radius", 0, 14)
         self.toolbar_padding = int_row("Toolbar side padding", "toolbar_padding", 0, 18)
-        self.toolbar_button_spacing = int_row("Button spacing", "toolbar_button_spacing", 0, 12)
-        self.toolbar_group_spacing = int_row("Group spacing", "toolbar_group_spacing", 0, 24)
-        self.page_rail_padding = int_row("Page rail side padding", "page_rail_padding", 0, 18)
+        self.toolbar_button_spacing = int_row(
+            "Button spacing", "toolbar_button_spacing", 0, 12
+        )
+        self.toolbar_group_spacing = int_row(
+            "Group spacing", "toolbar_group_spacing", 0, 24
+        )
+        self.page_rail_padding = int_row(
+            "Page rail side padding", "page_rail_padding", 0, 18
+        )
         self.button_size = int_row("Button width", "button_size", 24, 34)
         self.button_height = int_row("Button height", "button_height", 22, 32)
 
@@ -1915,13 +2208,15 @@ class UiSettingsDialog(QDialog):
         form.addRow("Close behavior", self.hide_on_close)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.RestoreDefaults |
-            QDialogButtonBox.StandardButton.Save |
-            QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.RestoreDefaults
+            | QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(self._restore_defaults)
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(
+            self._restore_defaults
+        )
         root.addWidget(buttons)
 
     def _restore_defaults(self):
@@ -1968,12 +2263,103 @@ class UiSettingsDialog(QDialog):
         return normalized_ui_settings(values)
 
 
+# ── page list dialog ─────────────────────────────────────────────────────────
+
+
+class PageListDialog(QDialog):
+    """Popup listing all page titles; clicking one activates that page."""
+
+    page_selected = pyqtSignal(int)
+
+    _STYLE = (
+        "QDialog { background:#16213e; border:1px solid #2d2d4e; }"
+        "QPushButton#page-item {"
+        "  background:transparent; color:#c9d1d9;"
+        "  border:none; border-radius:4px;"
+        "  padding:6px 14px; text-align:left; font-size:13px;"
+        "}"
+        "QPushButton#page-item:hover { background:#2d2d4e; color:#ffffff; }"
+        "QPushButton#page-item.current { color:#7ec8a4; font-weight:600; }"
+        "QScrollArea { border:none; background:transparent; }"
+        "QWidget#scroll-inner { background:transparent; }"
+    )
+
+    def __init__(self, parent, pages: list[str], current_idx: int):
+        super().__init__(
+            parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setStyleSheet(self._STYLE)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner.setObjectName("scroll-inner")
+        vbox = QVBoxLayout(inner)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(1)
+
+        for i, page_content in enumerate(pages):
+            if is_livecodes_content_config(page_content):
+                try:
+                    title = page_title_from_config(json.loads(page_content))
+                except Exception:
+                    title = ""
+            else:
+                title = page_title_from_html(str(page_content))
+            label = title.strip() or f"(Page {i + 1})"
+            display = f"{i + 1}.  {label}"
+
+            btn = QPushButton(display)
+            btn.setObjectName("page-item")
+            if i == current_idx:
+                btn.setProperty("class", "current")
+                btn.setStyleSheet(
+                    "QPushButton#page-item { color:#7ec8a4; font-weight:600;"
+                    " background:transparent; border:none; border-radius:4px;"
+                    " padding:6px 14px; text-align:left; font-size:13px; }"
+                    "QPushButton#page-item:hover { background:#2d2d4e; }"
+                )
+            btn.clicked.connect(lambda _=False, idx=i: self._select(idx))
+            vbox.addWidget(btn)
+
+        vbox.addStretch()
+        scroll.setWidget(inner)
+        scroll.setMaximumHeight(320)
+        root.addWidget(scroll)
+        self.adjustSize()
+
+    def _select(self, idx: int):
+        self.page_selected.emit(idx)
+        self.accept()
+
+    def show_near(self, global_pos: QPoint):
+        self.adjustSize()
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = max(
+            screen.left() + 4,
+            min(global_pos.x() - self.width() // 2, screen.right() - self.width() - 4),
+        )
+        y = global_pos.y() - self.height() - 4
+        if y < screen.top() + 4:
+            y = global_pos.y() + 4
+        self.move(x, y)
+        self.show()
+
+
 # ── main window ──────────────────────────────────────────────────────────────
+
 
 class ScratchPad(QWidget):
     """Main application window containing panes, terminal, and controls."""
+
+    _ollama_start = pyqtSignal(int)
     _ollama_chunk = pyqtSignal(int, str)
-    _ollama_done  = pyqtSignal(int, str)
+    _ollama_done = pyqtSignal(int, str)
 
     def __init__(self):
         super().__init__()
@@ -1998,6 +2384,7 @@ class ScratchPad(QWidget):
         except Exception as e:
             logger.warning("LiveCodes server was not started by Scratch: %s", e)
 
+        self._ollama_start.connect(self._on_ollama_start)
         self._ollama_chunk.connect(self._on_ollama_chunk)
         self._ollama_done.connect(self._on_ollama_done)
 
@@ -2022,7 +2409,11 @@ class ScratchPad(QWidget):
             try:
                 raw = json.loads(DATA_FILE.read_text())
             except Exception as e:
-                logger.warning("Failed to parse notes file %s: %s — starting with fresh notes", DATA_FILE, e)
+                logger.warning(
+                    "Failed to parse notes file %s: %s — starting with fresh notes",
+                    DATA_FILE,
+                    e,
+                )
                 raw = {}
             if isinstance(raw, dict):
                 raw_pages = raw.get("pages", [""])
@@ -2077,7 +2468,9 @@ class ScratchPad(QWidget):
                 raw = {}
             if isinstance(raw, dict):
                 for section, defaults in config.items():
-                    if isinstance(defaults, dict) and isinstance(raw.get(section), dict):
+                    if isinstance(defaults, dict) and isinstance(
+                        raw.get(section), dict
+                    ):
                         defaults.update(raw[section])
                     elif section in raw:
                         config[section] = raw[section]
@@ -2155,16 +2548,18 @@ class ScratchPad(QWidget):
 
         if "x" in ws and "y" in ws:
             x, y = ws["x"], ws["y"]
-            screen = (QApplication.screenAt(QPoint(x + w // 2, y + h // 2))
-                      or QApplication.primaryScreen())
+            screen = (
+                QApplication.screenAt(QPoint(x + w // 2, y + h // 2))
+                or QApplication.primaryScreen()
+            )
             avail = screen.availableGeometry()
-            x = max(avail.left() + 10, min(x, avail.right()  - w - 10))
-            y = max(avail.top()  + 10, min(y, avail.bottom() - h - 10))
+            x = max(avail.left() + 10, min(x, avail.right() - w - 10))
+            y = max(avail.top() + 10, min(y, avail.bottom() - h - 10))
         else:
             avail = QApplication.primaryScreen().availableGeometry()
             pad = 40
-            x = avail.right()  - w - pad
-            y = avail.top()    +     pad
+            x = avail.right() - w - pad
+            y = avail.top() + pad
 
         # Store and apply AFTER all child widgets are built so the layout
         # cannot expand the window past the intended size.
@@ -2188,33 +2583,47 @@ class ScratchPad(QWidget):
         topbar.setFixedHeight(max(36, self._ui_settings["button_height"] + 12))
         self._topbar = topbar
         top = QHBoxLayout(topbar)
-        top.setContentsMargins(self._ui_settings["toolbar_padding"], 0, self._ui_settings["toolbar_padding"], 0)
+        top.setContentsMargins(
+            self._ui_settings["toolbar_padding"],
+            0,
+            self._ui_settings["toolbar_padding"],
+            0,
+        )
         top.setSpacing(self._ui_settings["toolbar_button_spacing"])
         self._top_layout = top
         self._toolbar_group_spacers = []
 
         def btn(label, obj_name="command", tip=None):
             b = QPushButton(label)
-            b.setFixedSize(QSize(self._ui_settings["button_size"], self._ui_settings["button_height"]))
-            if obj_name: b.setObjectName(obj_name)
-            if tip:      b.setToolTip(tip)
+            b.setFixedSize(
+                QSize(
+                    self._ui_settings["button_size"], self._ui_settings["button_height"]
+                )
+            )
+            if obj_name:
+                b.setObjectName(obj_name)
+            if tip:
+                b.setToolTip(tip)
             self._toolbar_buttons.append(b)
             return b
 
         self._toolbar_buttons = []
 
-        self.pin_btn = btn("📌", obj_name="pin-on", tip="Pin window  (Ctrl+P, double-click top bar)")
+        self.pin_btn = btn(
+            "📌", obj_name="pin-on", tip="Pin window  (Ctrl+P, double-click top bar)"
+        )
         self.pin_btn.clicked.connect(self._toggle_pin)
-
-        self.page_label = QLabel("1 / 1")
-        self.page_label.setObjectName("page-label")
-        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.add_btn = btn("+", obj_name="add", tip="New page  (Ctrl+N)")
         self.del_btn = btn("🗑", obj_name="del", tip="Delete current page  (Ctrl+W)")
         self.ask_btn = btn("🤖", tip="Ask Ollama  (Ctrl+Shift+A)")
         self.term_btn = btn("⌨", tip="Toggle terminal  (Ctrl+T)")
-        self.split_btn = btn("◫", tip="Split pane  (Ctrl+\\); close splits with Ctrl+Shift+\\")
+        self.split_btn = btn(
+            "◫", tip="Split pane  (Ctrl+\\); close splits with Ctrl+Shift+\\"
+        )
+        self.lc_editor_btn = btn("◧", tip="Show editor only")
+        self.lc_split_btn = btn("▥", tip="Show editor + result")
+        self.lc_result_btn = btn("◨", tip="Show result only")
         self.hide_btn = btn("–", tip="Hide to tray  (Ctrl+H)")
         self.quit_btn = btn("×", obj_name="danger", tip="Quit  (Ctrl+Q)")
 
@@ -2223,6 +2632,15 @@ class ScratchPad(QWidget):
         self.ask_btn.clicked.connect(self._ask_ollama)
         self.term_btn.clicked.connect(self._toggle_terminal)
         self.split_btn.clicked.connect(self._toggle_split_panes)
+        self.lc_editor_btn.clicked.connect(
+            lambda: self._run_livecodes_action("show", ["editor"])
+        )
+        self.lc_split_btn.clicked.connect(
+            lambda: self._run_livecodes_action("show", ["toggle-result"])
+        )
+        self.lc_result_btn.clicked.connect(
+            lambda: self._run_livecodes_action("show", ["result"])
+        )
         self.hide_btn.clicked.connect(self.hide)
         self.quit_btn.clicked.connect(self._quit)
 
@@ -2242,6 +2660,7 @@ class ScratchPad(QWidget):
         add_group(self.pin_btn)
         add_group(self.add_btn, self.del_btn)
         add_group(self.ask_btn, self.term_btn, self.split_btn)
+        add_group(self.lc_editor_btn, self.lc_split_btn, self.lc_result_btn)
         top.addStretch()
         add_group(self.hide_btn, self.quit_btn)
 
@@ -2252,18 +2671,33 @@ class ScratchPad(QWidget):
         navbar.setObjectName("navbar")
         navbar.setFixedHeight(34)
         nav = QGridLayout(navbar)
-        nav.setContentsMargins(self._ui_settings["page_rail_padding"], 0, self._ui_settings["page_rail_padding"], 0)
+        nav.setContentsMargins(
+            self._ui_settings["page_rail_padding"],
+            0,
+            self._ui_settings["page_rail_padding"],
+            0,
+        )
         nav.setHorizontalSpacing(4)
         self._nav_layout = nav
         nav.setColumnStretch(0, 1)
         nav.setColumnStretch(1, 1)
         nav.setColumnStretch(2, 1)
 
-        self.prev_btn = btn("◀", obj_name="nav", tip="Previous page  (Ctrl+Left, Ctrl+wheel up)")
+        self.prev_btn = btn(
+            "◀", obj_name="nav", tip="Previous page  (Ctrl+Left, Ctrl+wheel up)"
+        )
         self.prev_btn.clicked.connect(self._prev_page)
 
-        self.next_btn = btn("▶", obj_name="nav", tip="Next page  (Ctrl+Right, Ctrl+wheel down)")
+        self.next_btn = btn(
+            "▶", obj_name="nav", tip="Next page  (Ctrl+Right, Ctrl+wheel down)"
+        )
         self.next_btn.clicked.connect(self._next_page)
+
+        self.page_counter_btn = QPushButton("1 / 1")
+        self.page_counter_btn.setObjectName("nav-counter")
+        self.page_counter_btn.setFlat(True)
+        self.page_counter_btn.setToolTip("All pages")
+        self.page_counter_btn.clicked.connect(self._show_page_list)
 
         right_nav = QWidget(self)
         right_nav_layout = QHBoxLayout(right_nav)
@@ -2273,7 +2707,7 @@ class ScratchPad(QWidget):
         right_nav_layout.addWidget(self.next_btn)
 
         nav.addWidget(self.prev_btn, 0, 0, Qt.AlignmentFlag.AlignLeft)
-        nav.addWidget(self.page_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        nav.addWidget(self.page_counter_btn, 0, 1, Qt.AlignmentFlag.AlignCenter)
         nav.addWidget(right_nav, 0, 2)
 
         root.addWidget(topbar)
@@ -2321,7 +2755,9 @@ class ScratchPad(QWidget):
         handles["top-left"].setGeometry(0, 0, corner, corner)
         handles["top-right"].setGeometry(width - corner, 0, corner, corner)
         handles["bottom-left"].setGeometry(0, height - corner, corner, corner)
-        handles["bottom-right"].setGeometry(width - corner, height - corner, corner, corner)
+        handles["bottom-right"].setGeometry(
+            width - corner, height - corner, corner, corner
+        )
 
         for handle in handles.values():
             handle.raise_()
@@ -2331,15 +2767,19 @@ class ScratchPad(QWidget):
         self.global_term = QWebEngineView(self)
         self.global_term.setMinimumSize(QSize(0, 0))
         s = self.global_term.settings()
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
+        s.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
+        )
+        s.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False
+        )
         self.global_term_bridge = TerminalBridge(self)
         self.global_term_channel = QWebChannel(self)
         self.global_term_channel.registerObject("bridge", self.global_term_bridge)
         self.global_term.page().setWebChannel(self.global_term_channel)
         self.global_term.hide()
-        self._terminal_loaded    = False
-        self._pending_pty_cwd   = None
+        self._terminal_loaded = False
+        self._pending_pty_cwd = None
 
         self.global_pty = PtyManager(
             on_data=lambda d: self.global_term_bridge.terminalOutputSignal.emit(d),
@@ -2354,9 +2794,9 @@ class ScratchPad(QWidget):
     def _add_pane(self, page):
         pane = QuillPane(self, page)
         pane.content_changed.connect(
-            lambda pi, html, origin=pane: self._on_any_content_changed(pi, html, origin))
-        pane.page_loaded.connect(
-            lambda pi, p=pane: self._on_pane_page_loaded(p, pi))
+            lambda pi, html, origin=pane: self._on_any_content_changed(pi, html, origin)
+        )
+        pane.page_loaded.connect(lambda pi, p=pane: self._on_pane_page_loaded(p, pi))
         pane.chat_message_sent.connect(self._on_chat_message)
         pane.restore_history_requested.connect(self._on_restore_history)
         self._panes.append(pane)
@@ -2397,12 +2837,39 @@ class ScratchPad(QWidget):
             self._flush_save()
             if callback:
                 callback()
+
         self._active_pane().capture_and_then(finish)
+
+    def _reindex_chat_pages_after_insert(self, insert_index: int):
+        self._chat_pages = reindex_page_map_after_insert(self._chat_pages, insert_index)
+
+    def _reindex_chat_pages_after_delete(self, delete_index: int):
+        self._chat_pages = reindex_page_map_after_delete(self._chat_pages, delete_index)
+
+    def _rebuild_chat_pages_from_notes(self):
+        self._chat_pages = {
+            idx: messages
+            for idx, page in enumerate(self.notes["pages"])
+            if (messages := parse_chat_page_html(page)) is not None
+        }
+
+    def _reindex_open_panes_after_insert(self, insert_index: int):
+        for pane in self._panes:
+            if pane.page_index >= insert_index:
+                pane.load_page(pane.page_index + 1)
+
+    def _reindex_open_panes_after_delete(self, delete_index: int):
+        new_max = len(self.notes["pages"]) - 1
+        for pane in self._panes:
+            if pane.page_index == delete_index:
+                pane.load_page(min(delete_index, new_max))
+            elif pane.page_index > delete_index:
+                pane.load_page(pane.page_index - 1)
 
     def _split_pane(self):
         if len(self._panes) >= 3:
             return
-        total   = len(self.notes["pages"])
+        total = len(self.notes["pages"])
         current = self._active_pane().page_index
         self._add_pane((current + 1) % total)
         self._active_pane_index = len(self._panes) - 1
@@ -2426,11 +2893,28 @@ class ScratchPad(QWidget):
 
     def _update_nav(self):
         total = len(self.notes["pages"])
-        idx   = self._active_pane().page_index
-        self.page_label.setText(f"{idx + 1} / {total}")
+        idx = self._active_pane().page_index
+        self.page_counter_btn.setText(f"{idx + 1} / {total}")
         self.prev_btn.setEnabled(idx > 0)
         self.next_btn.setEnabled(idx < total - 1)
         self._sync_command_states()
+
+    def _show_page_list(self):
+        pages = self.notes["pages"]
+        current_idx = self._active_pane().page_index
+        dlg = PageListDialog(self, pages, current_idx)
+        dlg.page_selected.connect(self._go_to_page_result_view)
+        btn_center = self.page_counter_btn.mapToGlobal(
+            QPoint(self.page_counter_btn.width() // 2, 0)
+        )
+        dlg.show_near(btn_center)
+
+    def _go_to_page_result_view(self, idx: int):
+        self._after_content_snapshot(lambda target=idx: self._load_page_result(target))
+
+    def _load_page_result(self, idx: int):
+        self._load_active_page(idx)
+        self._run_livecodes_action("show", ["result"])
 
     def _set_button_object_name(self, button, name):
         if button.objectName() == name:
@@ -2443,7 +2927,9 @@ class ScratchPad(QWidget):
         self._ui_settings = normalized_ui_settings(self.config.get("ui", {}))
         self.setStyleSheet(style_from_ui(self._ui_settings))
         if hasattr(self, "_topbar"):
-            self._topbar.setFixedHeight(max(36, self._ui_settings["button_height"] + 12))
+            self._topbar.setFixedHeight(
+                max(36, self._ui_settings["button_height"] + 12)
+            )
         if hasattr(self, "_top_layout"):
             pad = self._ui_settings["toolbar_padding"]
             self._top_layout.setContentsMargins(pad, 0, pad, 0)
@@ -2461,7 +2947,11 @@ class ScratchPad(QWidget):
         if hasattr(self, "_top_layout"):
             self._top_layout.invalidate()
         for button in getattr(self, "_toolbar_buttons", []):
-            button.setFixedSize(QSize(self._ui_settings["button_size"], self._ui_settings["button_height"]))
+            button.setFixedSize(
+                QSize(
+                    self._ui_settings["button_size"], self._ui_settings["button_height"]
+                )
+            )
             button.style().unpolish(button)
             button.style().polish(button)
         self.updateGeometry()
@@ -2483,12 +2973,16 @@ class ScratchPad(QWidget):
     def _prev_page(self):
         pane = self._active_pane()
         if pane.page_index > 0:
-            self._after_content_snapshot(lambda target=pane.page_index - 1: self._load_active_page(target))
+            self._after_content_snapshot(
+                lambda target=pane.page_index - 1: self._load_active_page(target)
+            )
 
     def _next_page(self):
         pane = self._active_pane()
         if pane.page_index < len(self.notes["pages"]) - 1:
-            self._after_content_snapshot(lambda target=pane.page_index + 1: self._load_active_page(target))
+            self._after_content_snapshot(
+                lambda target=pane.page_index + 1: self._load_active_page(target)
+            )
 
     def _load_active_page(self, index):
         self._active_pane().load_page(index)
@@ -2501,7 +2995,10 @@ class ScratchPad(QWidget):
 
     def _new_page_after_snapshot(self, idx):
         self._flush_save()
-        self.notes["pages"].insert(idx + 1, "")
+        insert_idx = idx + 1
+        self.notes["pages"].insert(insert_idx, "")
+        self._reindex_chat_pages_after_insert(insert_idx)
+        self._reindex_open_panes_after_insert(insert_idx)
         self._active_pane().load_page(idx + 1)
         self._flush_save()
         self._update_nav()
@@ -2513,13 +3010,15 @@ class ScratchPad(QWidget):
             QMessageBox.information(self, "Clean up", "No blank pages found.")
             return
         reply = QMessageBox.question(
-            self, "Remove blank pages",
+            self,
+            "Remove blank pages",
             f"Remove {removed} blank page{'s' if removed != 1 else ''}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
         self.notes["pages"] = non_blank or [""]
+        self._rebuild_chat_pages_from_notes()
         new_max = len(self.notes["pages"]) - 1
         for pane in self._panes:
             pane.load_page(min(pane.page_index, new_max))
@@ -2536,7 +3035,8 @@ class ScratchPad(QWidget):
             return
         idx = pane.page_index
         self.notes["pages"].pop(idx)
-        pane.load_page(min(idx, len(self.notes["pages"]) - 1))
+        self._reindex_chat_pages_after_delete(idx)
+        self._reindex_open_panes_after_delete(idx)
         self._flush_save()
         self._update_nav()
 
@@ -2551,7 +3051,7 @@ class ScratchPad(QWidget):
 
     def _open_terminal(self, cwd=None):
         if not self.global_term.isVisible():
-            if not hasattr(self, '_main_split'):
+            if not hasattr(self, "_main_split"):
                 self._main_split = QSplitter(Qt.Orientation.Vertical, self)
                 self._main_split.setChildrenCollapsible(False)
                 self._main_split.addWidget(self.h_split)
@@ -2588,7 +3088,7 @@ class ScratchPad(QWidget):
 
     def _close_terminal(self):
         if self.global_term.isVisible():
-            if hasattr(self, '_main_split'):
+            if hasattr(self, "_main_split"):
                 sizes = self._main_split.sizes()
                 if len(sizes) == 2 and sizes[1] > 0:
                     self._term_height = sizes[1]
@@ -2639,7 +3139,9 @@ class ScratchPad(QWidget):
             return
         self._send_to_ollama(dlg.value(), profile_name=dlg.selected_profile())
 
-    def _send_to_ollama(self, prompt, *, chat_page_idx=None, profile_name: str | None = None):
+    def _send_to_ollama(
+        self, prompt, *, chat_page_idx=None, profile_name: str | None = None
+    ):
         """Start a new chat from the current note, or append a follow-up to an existing chat page."""
         ollama = self.config.get("ollama", {})
         profile = self._active_ollama_profile(override=profile_name)
@@ -2648,6 +3150,7 @@ class ScratchPad(QWidget):
         base_url = (ollama.get("base_url") or "http://localhost:11434").rstrip("/")
         model_params = profile.get("model_params") or {}
         options = dict(model_params) if model_params else None
+        keep_alive = _ollama_keep_alive()
 
         is_followup = chat_page_idx is not None
 
@@ -2655,7 +3158,13 @@ class ScratchPad(QWidget):
             history = self._chat_pages[chat_page_idx]
             history.append({"role": "user", "content": prompt})
             payload = json.dumps(
-                ollama_chat_payload(history, model=model, system=system, options=options)
+                ollama_chat_payload(
+                    history,
+                    model=model,
+                    system=system,
+                    options=options,
+                    keep_alive=keep_alive,
+                )
             ).encode()
             req = urllib.request.Request(
                 f"{base_url}/api/chat",
@@ -2679,22 +3188,36 @@ class ScratchPad(QWidget):
                 extra_system_parts.append(f"[{label}]\n{content}")
             else:
                 label = inj.get("label", "Injected context")
-                context_messages.append({"role": "user", "content": f"[{label}]\n{content}"})
+                context_messages.append(
+                    {"role": "user", "content": f"[{label}]\n{content}"}
+                )
                 context_messages.append({"role": "assistant", "content": "Understood."})
 
         if extra_system_parts:
-            system = ((system + "\n\n") if system else "") + "\n\n".join(extra_system_parts)
+            system = ((system + "\n\n") if system else "") + "\n\n".join(
+                extra_system_parts
+            )
 
         page_idx = self._active_pane().page_index
         text_content = plain_text_from_html(self.notes["pages"][page_idx])
         history: list[dict] = list(context_messages)
         if text_content.strip():
-            history.append({"role": "user", "content": f"Context from my note:\n{text_content}"})
-            history.append({"role": "assistant", "content": "Got it. What would you like to know?"})
+            history.append(
+                {"role": "user", "content": f"Context from my note:\n{text_content}"}
+            )
+            history.append(
+                {"role": "assistant", "content": "Got it. What would you like to know?"}
+            )
         history.append({"role": "user", "content": prompt})
 
         payload = json.dumps(
-            ollama_chat_payload(history, model=model, system=system, options=options)
+            ollama_chat_payload(
+                history,
+                model=model,
+                system=system,
+                options=options,
+                keep_alive=keep_alive,
+            )
         ).encode()
         req = urllib.request.Request(
             f"{base_url}/api/chat",
@@ -2707,6 +3230,8 @@ class ScratchPad(QWidget):
             self._flush_save()
             response_idx = self._active_pane().page_index + 1
             self.notes["pages"].insert(response_idx, "")
+            self._reindex_chat_pages_after_insert(response_idx)
+            self._reindex_open_panes_after_insert(response_idx)
             self._chat_pages[response_idx] = history
             self._active_pane().load_page(response_idx)
             self._active_pane().set_edit_mode(False)
@@ -2721,12 +3246,16 @@ class ScratchPad(QWidget):
         self._after_content_snapshot(_after_snapshot)
 
     def _stream_ollama_chat(self, req, page_index, *, use_chat_endpoint=True):
-        chunk_fn = ollama_chat_stream_chunks if use_chat_endpoint else ollama_stream_chunks
+        chunk_fn = (
+            ollama_chat_stream_chunks if use_chat_endpoint else ollama_stream_chunks
+        )
+        timeout = _ollama_request_timeout()
+        self._ollama_start.emit(page_index)
 
         def _stream():
             chunks = []
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     for chunk in chunk_fn(resp):
                         chunks.append(chunk)
                         self._ollama_chunk.emit(page_index, chunk)
@@ -2742,7 +3271,15 @@ class ScratchPad(QWidget):
             return
         self._send_to_ollama(prompt, chat_page_idx=page_index)
 
+    def _on_ollama_start(self, page_index):
+        for pane in self._panes:
+            if pane.page_index == page_index:
+                pane.set_connecting()
+
     def _on_ollama_chunk(self, page_index, chunk):
+        for pane in self._panes:
+            if pane.page_index == page_index and pane._chat_state == "connecting":
+                pane.set_streaming()
         if page_index in self._chat_pages:
             history = self._chat_pages[page_index]
             if not history or history[-1]["role"] != "assistant":
@@ -2762,6 +3299,9 @@ class ScratchPad(QWidget):
         self._update_nav()
 
     def _on_ollama_done(self, page_index, full_text):
+        for pane in self._panes:
+            if pane.page_index == page_index:
+                pane.set_idle()
         if page_index in self._chat_pages:
             final_html = chat_page_html(self._chat_pages[page_index])
             self.notes["pages"][page_index] = final_html
@@ -2795,11 +3335,6 @@ class ScratchPad(QWidget):
                 action.setShortcut(QKeySequence(shortcut))
             return action
 
-        lc_editor_act = add_action("LiveCodes: show editor")
-        lc_result_act = add_action("LiveCodes: show result")
-        lc_toggle_result_act = add_action("LiveCodes: toggle result")
-        lc_run_act = add_action("LiveCodes: run project")
-        lc_format_act = add_action("LiveCodes: format code")
         lc_cut_act = add_action("Cut")
         lc_copy_act = add_action("Copy")
         lc_paste_act = add_action("Paste")
@@ -2809,6 +3344,8 @@ class ScratchPad(QWidget):
         term_act = add_action("Toggle terminal", "Ctrl+T")
         split_act = add_action("Split / unsplit", "Ctrl+\\")
         menu.addSeparator()
+        lc_format_act = add_action("Format code")
+        menu.addSeparator()
         share_menu = menu.addMenu("Share")
         share_copy_act = share_menu.addAction("Copy share text")
         share_copy_act.triggered.connect(lambda: self._share_current("clipboard", {}))
@@ -2816,7 +3353,9 @@ class ScratchPad(QWidget):
         share_ai_act.triggered.connect(lambda: self._share_current("ai_clipboard", {}))
         telegram = self.config.get("telegram", {})
         default_chat = telegram.get("default_chat_id", "")
-        share_tg_act = share_menu.addAction("Telegram default" if default_chat else "Configure Telegram...")
+        share_tg_act = share_menu.addAction(
+            "Telegram default" if default_chat else "Configure Telegram..."
+        )
         share_tg_act.triggered.connect(
             (lambda: self._share_current("telegram", {"chat_id": default_chat}))
             if default_chat
@@ -2825,12 +3364,18 @@ class ScratchPad(QWidget):
         for target in self.config.get("share_targets", []):
             if not isinstance(target, dict):
                 continue
-            action = share_menu.addAction(str(target.get("name") or target.get("kind") or "Target"))
+            action = share_menu.addAction(
+                str(target.get("name") or target.get("kind") or "Target")
+            )
             action.triggered.connect(
-                lambda checked=False, t=target: self._share_current(str(t.get("kind", "")), t)
+                lambda checked=False, t=target: self._share_current(
+                    str(t.get("kind", "")), t
+                )
             )
         share_menu.addSeparator()
-        share_menu.addAction("Configure sharing...").triggered.connect(self._open_config_panel)
+        share_menu.addAction("Configure sharing...").triggered.connect(
+            self._open_config_panel
+        )
         ui_settings_act = add_action("Window UI settings...")
         config_act = add_action("Configure sharing/Ollama...")
         menu.addSeparator()
@@ -2846,6 +3391,7 @@ class ScratchPad(QWidget):
             ask_act: self._ask_ollama,
             term_act: self._toggle_terminal,
             split_act: self._toggle_split_panes,
+            lc_format_act: lambda: self._run_livecodes_action("format"),
             ui_settings_act: self._open_ui_settings_panel,
             config_act: self._open_config_panel,
             export_act: self._export_page,
@@ -2854,11 +3400,6 @@ class ScratchPad(QWidget):
             remove_blanks_act: self._remove_blank_pages,
             hide_act: self.hide,
             quit_act: self._quit,
-            lc_editor_act: lambda: self._run_livecodes_action("show", ["editor"]),
-            lc_result_act: lambda: self._run_livecodes_action("show", ["result"]),
-            lc_toggle_result_act: lambda: self._run_livecodes_action("show", ["toggle-result"]),
-            lc_run_act: lambda: self._run_livecodes_action("run"),
-            lc_format_act: lambda: self._run_livecodes_action("format"),
             lc_cut_act: lambda: self._run_livecodes_edit_action("cut"),
             lc_copy_act: lambda: self._run_livecodes_edit_action("copy"),
             lc_paste_act: lambda: self._run_livecodes_edit_action("paste"),
@@ -2888,16 +3429,7 @@ class ScratchPad(QWidget):
         pane = self._active_pane()
         if not pane or not pane._editor_ready:
             return
-        action_map = {
-            "cut": QWebEnginePage.WebAction.Cut,
-            "copy": QWebEnginePage.WebAction.Copy,
-            "paste": QWebEnginePage.WebAction.Paste,
-            "selectAll": QWebEnginePage.WebAction.SelectAll,
-        }
-        web_action = action_map.get(command)
-        if web_action is not None:
-            page = pane.view.page()
-            QTimer.singleShot(0, lambda: page.triggerAction(web_action))
+        pane.run_livecodes_edit_command(command)
 
     def _open_config_panel(self):
         dialog = ConfigDialog(self, self.config)
@@ -2966,7 +3498,11 @@ class ScratchPad(QWidget):
                 QApplication.clipboard().setText(text)
                 QMessageBox.information(self, "Share", "Copied share text.")
             elif kind == "ai_clipboard":
-                label = "selected content" if payload.get("selected") else "full Scratch note"
+                label = (
+                    "selected content"
+                    if payload.get("selected")
+                    else "full Scratch note"
+                )
                 QApplication.clipboard().setText(
                     f"Use this {label} as context:\n\n{text}"
                 )
@@ -2978,24 +3514,40 @@ class ScratchPad(QWidget):
             elif kind == "local_folder":
                 path = Path(target.get("path", "")).expanduser()
                 path.mkdir(parents=True, exist_ok=True)
-                file_path = self._share_payload_file(payload, target.get("format", "html"))
+                file_path = self._share_payload_file(
+                    payload, target.get("format", "html")
+                )
                 dest = path / file_path.name
                 shutil.copy2(file_path, dest)
                 QMessageBox.information(self, "Share", f"Shared to {dest}")
             elif kind in {"scp", "sftp"}:
                 destination = target.get("destination", "")
                 if not destination:
-                    raise ValueError("Missing destination, for example nova:/home/ash/inbox/")
-                file_path = self._share_payload_file(payload, target.get("format", "html"))
-                subprocess.run(["scp", str(file_path), destination], check=True, timeout=45)
+                    raise ValueError(
+                        "Missing destination, for example nova:/home/ash/inbox/"
+                    )
+                file_path = self._share_payload_file(
+                    payload, target.get("format", "html")
+                )
+                subprocess.run(
+                    ["scp", str(file_path), destination], check=True, timeout=45
+                )
                 QMessageBox.information(self, "Share", f"Shared to {destination}")
             elif kind == "taildrop":
                 device = target.get("device", "")
                 if not device:
                     raise ValueError("Missing Taildrop device name")
-                file_path = self._share_payload_file(payload, target.get("format", "html"))
-                subprocess.run(["tailscale", "file", "cp", str(file_path), f"{device}:"], check=True, timeout=45)
-                QMessageBox.information(self, "Share", f"Sent to {device} with Taildrop.")
+                file_path = self._share_payload_file(
+                    payload, target.get("format", "html")
+                )
+                subprocess.run(
+                    ["tailscale", "file", "cp", str(file_path), f"{device}:"],
+                    check=True,
+                    timeout=45,
+                )
+                QMessageBox.information(
+                    self, "Share", f"Sent to {device} with Taildrop."
+                )
             elif kind == "command":
                 self._share_to_command(target, payload, text)
             else:
@@ -3023,14 +3575,20 @@ class ScratchPad(QWidget):
         QMessageBox.information(self, "Share", "Sent to Telegram.")
 
     def _share_to_ntfy(self, target, text):
-        url = target.get("url") or target.get("topic_url") or self.config.get("ntfy", {}).get("url", "")
+        url = (
+            target.get("url")
+            or target.get("topic_url")
+            or self.config.get("ntfy", {}).get("url", "")
+        )
         if not url:
             raise ValueError("Missing ntfy URL")
         headers = {}
         token = target.get("token") or self.config.get("ntfy", {}).get("token", "")
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        req = urllib.request.Request(url, data=text.encode("utf-8"), headers=headers, method="POST")
+        req = urllib.request.Request(
+            url, data=text.encode("utf-8"), headers=headers, method="POST"
+        )
         with urllib.request.urlopen(req, timeout=20):
             pass
         QMessageBox.information(self, "Share", "Sent to ntfy.")
@@ -3070,7 +3628,9 @@ class ScratchPad(QWidget):
         html = self.notes["pages"][self._active_pane().page_index]
 
         path, sel = QFileDialog.getSaveFileName(
-            self, "Export page", str(Path.home()),
+            self,
+            "Export page",
+            str(Path.home()),
             "HTML (*.html);;Plain text (*.txt)",
         )
         if not path:
@@ -3089,11 +3649,14 @@ class ScratchPad(QWidget):
     # ── window events ─────────────────────────────────────────────────────────
 
     def sizeHint(self):
-        _, _, w, h = getattr(self, '_init_geometry', (0, 0, 440, 460))
+        _, _, w, h = getattr(self, "_init_geometry", (0, 0, 440, 460))
         return QSize(w, h)
 
     def wheelEvent(self, event):
-        if self._ui_settings["ctrl_wheel_pages"] and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        if (
+            self._ui_settings["ctrl_wheel_pages"]
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
             if event.angleDelta().y() < 0:
                 self._next_page()
             elif event.angleDelta().y() > 0:
@@ -3140,15 +3703,19 @@ class ScratchPad(QWidget):
 
 # ── entrypoint ────────────────────────────────────────────────────────────────
 
+
 def _detach_from_terminal():
     if os.environ.get("SCRATCH_DETACHED") or not sys.stdin.isatty():
         return
     import subprocess as _sp
+
     _sp.Popen(
         [sys.executable] + sys.argv,
         env={**os.environ, "SCRATCH_DETACHED": "1"},
         start_new_session=True,
-        stdin=_sp.DEVNULL, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        stdin=_sp.DEVNULL,
+        stdout=_sp.DEVNULL,
+        stderr=_sp.DEVNULL,
         close_fds=True,
     )
     sys.exit(0)
@@ -3185,22 +3752,29 @@ def main():
     )
 
     icon_path = Path.home() / ".local/share/icons/scratch.svg"
-    icon = (QIcon(str(icon_path)) if icon_path.exists()
-            else QIcon.fromTheme("accessories-text-editor"))
+    icon = (
+        QIcon(str(icon_path))
+        if icon_path.exists()
+        else QIcon.fromTheme("accessories-text-editor")
+    )
     tray = QSystemTrayIcon(icon, app)
     tray.setToolTip("Scratch")
 
     menu = QMenu()
-    show_act   = menu.addAction("Show Scratch")
+    show_act = menu.addAction("Show Scratch")
     menu.addSeparator()
-    quit_act   = menu.addAction("Quit")
+    quit_act = menu.addAction("Quit")
     tray.setContextMenu(menu)
 
     show_act.triggered.connect(win.show_and_raise)
     quit_act.triggered.connect(win._quit)
     tray.activated.connect(
-        lambda r: win.show_and_raise()
-        if r == QSystemTrayIcon.ActivationReason.Trigger else None)
+        lambda r: (
+            win.show_and_raise()
+            if r == QSystemTrayIcon.ActivationReason.Trigger
+            else None
+        )
+    )
     tray.show()
 
     app.aboutToQuit.connect(win._flush_save)

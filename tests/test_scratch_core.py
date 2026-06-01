@@ -12,7 +12,10 @@ def test_load_notes_defaults_to_single_blank_page():
 def test_load_notes_rejects_invalid_payload():
     assert scratch_core.normalize_notes({}) == {"pages": [""], "window": {}}
     assert scratch_core.normalize_notes({"pages": []}) == {"pages": [""], "window": {}}
-    assert scratch_core.normalize_notes({"pages": ["ok", 1]}) == {"pages": ["ok", ""], "window": {}}
+    assert scratch_core.normalize_notes({"pages": ["ok", 1]}) == {
+        "pages": ["ok", ""],
+        "window": {},
+    }
 
 
 def test_page_title_from_html_strips_tags_and_truncates():
@@ -86,6 +89,36 @@ def test_preformatted_html_escapes_generated_text():
     rendered = scratch_core.preformatted_html("a <b>tag</b> & value")
 
     assert rendered == "<pre>a &lt;b&gt;tag&lt;/b&gt; &amp; value</pre>"
+
+
+def test_reindex_page_map_after_insert_shifts_at_and_after_insert():
+    histories = {0: "first", 2: "chat", 4: "later"}
+
+    assert scratch_core.reindex_page_map_after_insert(histories, 2) == {
+        0: "first",
+        3: "chat",
+        5: "later",
+    }
+
+
+def test_reindex_page_map_after_delete_drops_deleted_and_shifts_later_pages():
+    histories = {0: "first", 2: "deleted", 4: "later"}
+
+    assert scratch_core.reindex_page_map_after_delete(histories, 2) == {
+        0: "first",
+        3: "later",
+    }
+
+
+def test_ollama_chat_payload_can_request_keep_alive():
+    payload = scratch_core.ollama_chat_payload(
+        [{"role": "user", "content": "hello"}],
+        model="example",
+        keep_alive="30m",
+    )
+
+    assert payload["keep_alive"] == "30m"
+    assert payload["stream"] is True
 
 
 def test_migrate_notes_converts_plain_text_pages_only():
@@ -182,7 +215,9 @@ def test_hit_test_resize_edges_prefers_corners():
     rect = scratch_core.Rect(10, 20, 300, 200)
 
     assert scratch_core.hit_test_resize_edges((11, 21), rect, margin=8) == "top-left"
-    assert scratch_core.hit_test_resize_edges((309, 219), rect, margin=8) == "bottom-right"
+    assert (
+        scratch_core.hit_test_resize_edges((309, 219), rect, margin=8) == "bottom-right"
+    )
     assert scratch_core.hit_test_resize_edges((160, 120), rect, margin=8) is None
 
 
@@ -256,7 +291,9 @@ def test_livecodes_config_validation_requires_content_panel():
     assert scratch_core.is_livecodes_content_config({"markup": {"content": ""}})
     assert scratch_core.is_livecodes_content_config({"style": {"content": "body {}"}})
     assert not scratch_core.is_livecodes_content_config({})
-    assert not scratch_core.is_livecodes_content_config({"markup": {"language": "markdown"}})
+    assert not scratch_core.is_livecodes_content_config(
+        {"markup": {"language": "markdown"}}
+    )
     assert not scratch_core.is_livecodes_content_config({"markup": {"content": None}})
 
 
@@ -362,6 +399,6 @@ def test_ollama_stream_chunks_yields_text():
 
 
 def test_ollama_stream_chunks_skips_malformed():
-    lines = [b'not json\n', b'{"response":"ok","done":true}\n']
+    lines = [b"not json\n", b'{"response":"ok","done":true}\n']
     chunks = list(scratch_core.ollama_stream_chunks(lines))
     assert chunks == ["ok"]
