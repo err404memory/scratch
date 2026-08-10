@@ -1,0 +1,31 @@
+[project]
+name = "scratch"
+version = "0.1.0"
+description = "A digital sticky note pad with Ollama integration"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyqt6>=6.10,<6.11",
+    "pyqt6-webengine>=6.10,<6.11",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-qt>=4.5.0",
+    "ruff>=0.15.15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+# Target your exact local Python version
+line-length = 150
+target-version = "py314"
+
+[tool.ruff.lint]
+# Select rules: E/W (Pycodestyle), F (Pyflakes), I (Isort include sorting)
+select = ["E", "W", "F", "I"]
+ignore = [] # Add error codes here if you want to silence specific warnings

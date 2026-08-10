@@ -1,0 +1,6 @@
+for f in ~/.bashrc.d/20-completions-*.sh; do
+    [ -f "$f" ] || continue
+    # Extract the tool name (e.g., 'bat' from '20-completions-bat.sh')
+    tool_name=$(basename "$f" | sed 's/20-completions-//')
+    mv "$f" ~/.bashrc.d/completions/"$tool_name"
+done

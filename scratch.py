@@ -82,6 +82,8 @@ from scratch_core import (
     migrate_ollama_config,
     ollama_chat_payload,
     ollama_chat_stream_chunks,
+    ollama_loaded_model_names,
+    ollama_model_is_loaded,
     ollama_stream_chunks,
     page_title_from_config,
     page_title_from_html,
@@ -253,6 +255,13 @@ QPushButton:hover {{ background: {ui["button_hover"]}; color: #ffffff; }}
 QPushButton#command {{ background: rgba(255,255,255,.04); color: {ui["button_color"]}; }}
 QPushButton#mode-on {{ background: #7ec8a4; color: #0f1720; font-weight: 700; }}
 QPushButton#tool-on {{ background: #7cc4ff; color: #0f1720; font-weight: 700; }}
+QPushButton#ai-unknown {{ color: #7f8aa6; }}
+QPushButton#ai-checking {{ color: #f8d66d; background: rgba(248,214,109,.10); }}
+QPushButton#ai-connected {{ color: #f8d66d; }}
+QPushButton#ai-loaded {{ color: #7ec8a4; background: rgba(126,200,164,.12); }}
+QPushButton#ai-processing {{ color: #7cc4ff; background: rgba(124,196,255,.16); }}
+QPushButton#ai-offline {{ color: #ff8f9a; background: rgba(255,143,154,.10); }}
+QPushButton#ai-error {{ color: #ff5f6d; background: rgba(255,95,109,.16); }}
 QPushButton#pin-on  {{
     color: #dffcff;
     background: qradialgradient(cx:.5, cy:.52, radius:.42,
@@ -479,6 +488,7 @@ class QuillPane(QWidget):
     chat_message_sent = pyqtSignal(int, str)  # page_index, text
     page_loaded = pyqtSignal(int)  # page_index
     restore_history_requested = pyqtSignal(int)  # page_index
+    stop_requested = pyqtSignal(int)  # page_index
 
     _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -549,6 +559,10 @@ class QuillPane(QWidget):
         self._send_btn = QPushButton("Send", self._chat_bar)
         self._send_btn.setFixedWidth(56)
         self._send_btn.clicked.connect(self._on_chat_send)
+        self._stop_btn = QPushButton("Stop", self._chat_bar)
+        self._stop_btn.setFixedWidth(56)
+        self._stop_btn.clicked.connect(lambda: self.stop_requested.emit(self._page_index))
+        self._stop_btn.hide()
         self._restore_btn = QPushButton("Restore history", self._chat_bar)
         self._restore_btn.clicked.connect(
             lambda: self.restore_history_requested.emit(self._page_index)
@@ -556,6 +570,7 @@ class QuillPane(QWidget):
         self._restore_btn.hide()
         chat_hl.addWidget(self._restore_btn)
         chat_hl.addWidget(self._chat_input, 1)
+        chat_hl.addWidget(self._stop_btn)
         chat_hl.addWidget(self._send_btn)
         self._chat_bar.hide()
         layout.addWidget(self._chat_bar)
@@ -693,6 +708,7 @@ class QuillPane(QWidget):
             self._view_stack.setCurrentIndex(1)
             self._chat_input.setEnabled(not restore_available)
             self._send_btn.setEnabled(not restore_available)
+            self._stop_btn.hide()
             self._restore_btn.setVisible(restore_available)
         else:
             self._chat_bar.hide()
@@ -704,17 +720,21 @@ class QuillPane(QWidget):
         self._restore_btn.hide()
         self._chat_input.setEnabled(True)
         self._send_btn.setEnabled(True)
+        self._stop_btn.hide()
 
     def set_connecting(self):
         self._chat_state = "connecting"
         self._chat_input.setEnabled(False)
         self._send_btn.setEnabled(False)
+        self._stop_btn.show()
         self._start_spinner()
 
     def set_streaming(self):
         self._chat_state = "streaming"
         self._stop_spinner()
         self._send_btn.setText("●")
+        self._send_btn.setEnabled(False)
+        self._stop_btn.show()
 
     def set_idle(self):
         self._chat_state = "idle"
@@ -722,6 +742,7 @@ class QuillPane(QWidget):
         self._send_btn.setText("Send")
         self._send_btn.setEnabled(True)
         self._chat_input.setEnabled(True)
+        self._stop_btn.hide()
 
     def _start_spinner(self):
         self._spinner_frame = 0
@@ -776,16 +797,20 @@ class QuillPane(QWidget):
             self.chat_message_sent.emit(self._page_index, text)
 
     def eventFilter(self, obj, event):
-        if obj is self._chat_input and event.type() == QEvent.Type.KeyPress:
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
-                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-            ):
-                self._on_chat_send()
-                return True
-        if obj is self.view and event.type() == QEvent.Type.MouseButtonPress:
-            self.window().activateWindow()
-            self.window().raise_()
-        return super().eventFilter(obj, event)
+        try:
+            if obj is self._chat_input and event.type() == QEvent.Type.KeyPress:
+                if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+                    event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                ):
+                    self._on_chat_send()
+                    return True
+            if obj is self.view and event.type() == QEvent.Type.MouseButtonPress:
+                self.window().activateWindow()
+                self.window().raise_()
+            return super().eventFilter(obj, event)
+        except Exception:
+            logger.exception("Unhandled exception in Scratch event filter")
+            return False
 
     def toggle_edit_mode(self):
         self.set_edit_mode(not self._edit_mode)
@@ -2360,6 +2385,7 @@ class ScratchPad(QWidget):
     _ollama_start = pyqtSignal(int)
     _ollama_chunk = pyqtSignal(int, str)
     _ollama_done = pyqtSignal(int, str)
+    _ollama_status = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -2372,10 +2398,19 @@ class ScratchPad(QWidget):
         self._shortcuts = []
         self._term_height = 200
         self._chat_pages: dict[int, list] = {}  # page_index → message history
+        self._ollama_probe_running = False
+        self._ollama_active_requests: set[int] = set()
+        self._ollama_cancel_events: dict[int, threading.Event] = {}
+        self._ollama_responses: dict[int, object] = {}
+        self._ollama_stream_lock = threading.Lock()
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._flush_save)
+
+        self._ollama_status_timer = QTimer(self)
+        self._ollama_status_timer.setInterval(30000)
+        self._ollama_status_timer.timeout.connect(self._probe_ollama_status)
 
         self.livecodes_app_url = livecodes_url()
         try:
@@ -2387,6 +2422,7 @@ class ScratchPad(QWidget):
         self._ollama_start.connect(self._on_ollama_start)
         self._ollama_chunk.connect(self._on_ollama_chunk)
         self._ollama_done.connect(self._on_ollama_done)
+        self._ollama_status.connect(self._apply_ollama_status)
 
         self._build_window()
         self._build_ui()
@@ -2395,6 +2431,8 @@ class ScratchPad(QWidget):
         start_page = min(ws.get("active_page", 0), max(0, len(self.notes["pages"]) - 1))
         self._add_pane(page=start_page)
         self._update_nav()
+        self._ollama_status_timer.start()
+        QTimer.singleShot(600, self._probe_ollama_status)
 
         x, y, w, h = self._init_geometry
         self.resize(w, h)
@@ -2616,6 +2654,11 @@ class ScratchPad(QWidget):
 
         self.add_btn = btn("+", obj_name="add", tip="New page  (Ctrl+N)")
         self.del_btn = btn("🗑", obj_name="del", tip="Delete current page  (Ctrl+W)")
+        self.ai_status_btn = btn(
+            "◌",
+            obj_name="ai-unknown",
+            tip="Ollama status unknown. Click to check and warm the selected model.",
+        )
         self.ask_btn = btn("🤖", tip="Ask Ollama  (Ctrl+Shift+A)")
         self.term_btn = btn("⌨", tip="Toggle terminal  (Ctrl+T)")
         self.split_btn = btn(
@@ -2629,6 +2672,7 @@ class ScratchPad(QWidget):
 
         self.add_btn.clicked.connect(self._new_page)
         self.del_btn.clicked.connect(self._delete_page)
+        self.ai_status_btn.clicked.connect(lambda: self._probe_ollama_status(warm=True))
         self.ask_btn.clicked.connect(self._ask_ollama)
         self.term_btn.clicked.connect(self._toggle_terminal)
         self.split_btn.clicked.connect(self._toggle_split_panes)
@@ -2659,7 +2703,7 @@ class ScratchPad(QWidget):
 
         add_group(self.pin_btn)
         add_group(self.add_btn, self.del_btn)
-        add_group(self.ask_btn, self.term_btn, self.split_btn)
+        add_group(self.ai_status_btn, self.ask_btn, self.term_btn, self.split_btn)
         add_group(self.lc_editor_btn, self.lc_split_btn, self.lc_result_btn)
         top.addStretch()
         add_group(self.hide_btn, self.quit_btn)
@@ -2799,6 +2843,7 @@ class ScratchPad(QWidget):
         pane.page_loaded.connect(lambda pi, p=pane: self._on_pane_page_loaded(p, pi))
         pane.chat_message_sent.connect(self._on_chat_message)
         pane.restore_history_requested.connect(self._on_restore_history)
+        pane.stop_requested.connect(self._stop_ollama_response)
         self._panes.append(pane)
         self.h_split.addWidget(pane)
         pane.load_page(page)
@@ -2807,8 +2852,10 @@ class ScratchPad(QWidget):
     def _on_pane_page_loaded(self, pane: "QuillPane", page_idx: int):
         if page_idx in self._chat_pages:
             pane.set_chat_mode(True)
+            pane.show_chat_html(chat_page_html(self._chat_pages[page_idx]))
         elif is_chat_page_html(self.notes["pages"][page_idx]):
             pane.set_chat_mode(True, restore_available=True)
+            pane.show_chat_html(self.notes["pages"][page_idx])
         else:
             pane.set_chat_mode(False)
 
@@ -2817,9 +2864,11 @@ class ScratchPad(QWidget):
         if messages is None:
             return
         self._chat_pages[page_idx] = messages
+        rendered = chat_page_html(messages)
         for pane in self._panes:
             if pane.page_index == page_idx:
                 pane.set_history_restored()
+                pane.show_chat_html(rendered)
 
     def _on_any_content_changed(self, page_index, html, origin_pane=None):
         for pane in self._panes:
@@ -3130,6 +3179,94 @@ class ScratchPad(QWidget):
                 return p
         return profiles[0]
 
+    def _ollama_connection_target(self) -> tuple[str, str]:
+        ollama = self.config.get("ollama", {})
+        profile = self._active_ollama_profile()
+        base_url = (ollama.get("base_url") or "http://localhost:11434").rstrip("/")
+        model = profile.get("model", "llama3.2") or "llama3.2"
+        return base_url, model
+
+    def _apply_ollama_status(self, state: str, detail: str):
+        if not hasattr(self, "ai_status_btn"):
+            return
+        states = {
+            "unknown": ("◌", "ai-unknown"),
+            "checking": ("…", "ai-checking"),
+            "warming": ("◍", "ai-checking"),
+            "connected": ("○", "ai-connected"),
+            "loaded": ("●", "ai-loaded"),
+            "processing": ("●", "ai-processing"),
+            "offline": ("×", "ai-offline"),
+            "error": ("!", "ai-error"),
+        }
+        label, object_name = states.get(state, states["unknown"])
+        self.ai_status_btn.setText(label)
+        self._set_button_object_name(self.ai_status_btn, object_name)
+        self.ai_status_btn.setToolTip(detail)
+
+    def _probe_ollama_status(self, *, warm: bool = False):
+        if self._ollama_probe_running:
+            return
+        if self._ollama_active_requests:
+            self._ollama_status.emit(
+                "processing",
+                "Ollama is processing a Scratch prompt. Click is disabled until it finishes.",
+            )
+            return
+        self._ollama_probe_running = True
+        base_url, model = self._ollama_connection_target()
+        keep_alive = _ollama_keep_alive()
+        self._ollama_status.emit(
+            "warming" if warm else "checking",
+            f"Checking Ollama at {base_url} for {model}...",
+        )
+
+        def _probe():
+            try:
+                with urllib.request.urlopen(f"{base_url}/api/version", timeout=4) as resp:
+                    version_data = json.loads(resp.read().decode())
+                version = version_data.get("version", "unknown")
+                with urllib.request.urlopen(f"{base_url}/api/ps", timeout=4) as resp:
+                    ps_data = json.loads(resp.read().decode())
+                loaded_names = ollama_loaded_model_names(ps_data)
+                if warm and not ollama_model_is_loaded(ps_data, model):
+                    self._ollama_status.emit(
+                        "warming",
+                        f"Ollama {version} is connected. Loading {model}...",
+                    )
+                    warm_payload = {"model": model, "prompt": "", "stream": False}
+                    if keep_alive:
+                        warm_payload["keep_alive"] = keep_alive
+                    payload = json.dumps(warm_payload).encode()
+                    req = urllib.request.Request(
+                        f"{base_url}/api/generate",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=_ollama_request_timeout()) as resp:
+                        resp.read()
+                    with urllib.request.urlopen(f"{base_url}/api/ps", timeout=4) as resp:
+                        ps_data = json.loads(resp.read().decode())
+                    loaded_names = ollama_loaded_model_names(ps_data)
+                if ollama_model_is_loaded(ps_data, model):
+                    detail = f"Ollama {version}: {model} is loaded."
+                    if keep_alive:
+                        detail += f" keep_alive={keep_alive}."
+                    self._ollama_status.emit("loaded", detail)
+                else:
+                    loaded = ", ".join(loaded_names) if loaded_names else "no models loaded"
+                    self._ollama_status.emit(
+                        "connected",
+                        f"Ollama {version} is connected; {loaded}. Click to warm {model}.",
+                    )
+            except Exception as e:
+                self._ollama_status.emit("offline", f"Ollama is not reachable: {e}")
+            finally:
+                self._ollama_probe_running = False
+
+        threading.Thread(target=_probe, daemon=True).start()
+
     def _ask_ollama(self):
         ollama = self.config.get("ollama", {})
         profiles = ollama.get("profiles") or []
@@ -3250,21 +3387,48 @@ class ScratchPad(QWidget):
             ollama_chat_stream_chunks if use_chat_endpoint else ollama_stream_chunks
         )
         timeout = _ollama_request_timeout()
+        cancel_event = threading.Event()
+        with self._ollama_stream_lock:
+            self._ollama_cancel_events[page_index] = cancel_event
         self._ollama_start.emit(page_index)
 
         def _stream():
             chunks = []
+            stopped = False
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    with self._ollama_stream_lock:
+                        self._ollama_responses[page_index] = resp
                     for chunk in chunk_fn(resp):
+                        if cancel_event.is_set():
+                            stopped = True
+                            break
                         chunks.append(chunk)
                         self._ollama_chunk.emit(page_index, chunk)
-                response_text = "".join(chunks)
+                response_text = "[Stopped by user.]" if stopped else "".join(chunks)
             except Exception as e:
-                response_text = f"Error: {e}"
+                response_text = "[Stopped by user.]" if cancel_event.is_set() else f"Error: {e}"
+            finally:
+                with self._ollama_stream_lock:
+                    self._ollama_responses.pop(page_index, None)
+                    self._ollama_cancel_events.pop(page_index, None)
             self._ollama_done.emit(page_index, response_text)
 
         threading.Thread(target=_stream, daemon=True).start()
+
+    def _stop_ollama_response(self, page_index: int):
+        with self._ollama_stream_lock:
+            cancel_event = self._ollama_cancel_events.get(page_index)
+            response = self._ollama_responses.get(page_index)
+        if cancel_event is None:
+            return
+        cancel_event.set()
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        self._ollama_status.emit("error", "Stopping the current Ollama response...")
 
     def _on_chat_message(self, page_index, prompt):
         if page_index not in self._chat_pages:
@@ -3272,11 +3436,17 @@ class ScratchPad(QWidget):
         self._send_to_ollama(prompt, chat_page_idx=page_index)
 
     def _on_ollama_start(self, page_index):
+        self._ollama_active_requests.add(page_index)
+        self._ollama_status.emit(
+            "processing",
+            "Ollama is processing this prompt; waiting for the first token.",
+        )
         for pane in self._panes:
             if pane.page_index == page_index:
                 pane.set_connecting()
 
     def _on_ollama_chunk(self, page_index, chunk):
+        self._ollama_status.emit("processing", "Ollama is streaming a response.")
         for pane in self._panes:
             if pane.page_index == page_index and pane._chat_state == "connecting":
                 pane.set_streaming()
@@ -3299,10 +3469,35 @@ class ScratchPad(QWidget):
         self._update_nav()
 
     def _on_ollama_done(self, page_index, full_text):
+        self._ollama_active_requests.discard(page_index)
         for pane in self._panes:
             if pane.page_index == page_index:
                 pane.set_idle()
         if page_index in self._chat_pages:
+            if full_text == "[Stopped by user.]":
+                history = self._chat_pages[page_index]
+                if not history or history[-1].get("role") != "assistant":
+                    history.append({"role": "assistant", "content": full_text})
+                elif full_text not in history[-1].get("content", ""):
+                    history[-1]["content"] = (
+                        history[-1].get("content", "").rstrip() + "\n\n" + full_text
+                    ).strip()
+                self._ollama_status.emit(
+                    "loaded",
+                    "Stopped the response; Ollama should keep the model warm.",
+                )
+            elif full_text.startswith("Error:"):
+                history = self._chat_pages[page_index]
+                if not history or history[-1].get("role") != "assistant":
+                    history.append({"role": "assistant", "content": full_text})
+                elif not history[-1].get("content"):
+                    history[-1]["content"] = full_text
+                self._ollama_status.emit("error", full_text)
+            else:
+                self._ollama_status.emit(
+                    "loaded",
+                    "Ollama finished the response; the model should remain warm.",
+                )
             final_html = chat_page_html(self._chat_pages[page_index])
             self.notes["pages"][page_index] = final_html
             self._flush_save()
@@ -3311,12 +3506,22 @@ class ScratchPad(QWidget):
                     pane.show_chat_html(final_html)
         else:
             final_html = preformatted_html(full_text)
+            self._ollama_status.emit(
+                "error" if full_text.startswith("Error:") else "loaded",
+                full_text
+                if full_text.startswith("Error:")
+                else "Stopped the response."
+                if full_text == "[Stopped by user.]"
+                else "Ollama finished the response.",
+            )
             self.notes["pages"][page_index] = final_html
             self._flush_save()
             for pane in self._panes:
                 if pane.page_index == page_index and pane._editor_ready:
                     pane._send_content(final_html)
         self._update_nav()
+        if not full_text.startswith("Error:"):
+            QTimer.singleShot(1200, self._probe_ollama_status)
 
     def _context_menu_style(self):
         return (

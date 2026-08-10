@@ -992,6 +992,24 @@ def ollama_chat_stream_chunks(response_iter: Iterable[bytes]) -> Iterable[str]:
             break
 
 
+def ollama_loaded_model_names(ps_payload: dict[str, Any]) -> list[str]:
+    """Return loaded Ollama model names from an /api/ps payload."""
+    names: list[str] = []
+    for item in ps_payload.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        for key in ("name", "model"):
+            value = item.get(key)
+            if isinstance(value, str) and value and value not in names:
+                names.append(value)
+    return names
+
+
+def ollama_model_is_loaded(ps_payload: dict[str, Any], model: str) -> bool:
+    """Whether the requested model appears in an Ollama /api/ps payload."""
+    return model in ollama_loaded_model_names(ps_payload)
+
+
 _CHAT_CSS = (
     "<style>"
     "body{font:14px/1.65 -apple-system,sans-serif;background:#0d1117;color:#e6edf3;"

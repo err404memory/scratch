@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from PyQt6.QtWidgets import QApplication
@@ -195,6 +196,16 @@ def test_scratch_ui_exposes_low_friction_commands():
     assert "qradialgradient" in scratch_source
 
 
+def test_scratch_chat_has_stop_control_for_ollama_streams():
+    scratch_source = Path("scratch.py").read_text()
+
+    assert "self._stop_btn = QPushButton(\"Stop\", self._chat_bar)" in scratch_source
+    assert "stop_requested = pyqtSignal(int)" in scratch_source
+    assert "def _stop_ollama_response(self, page_index: int):" in scratch_source
+    assert "response.close()" in scratch_source
+    assert "[Stopped by user.]" in scratch_source
+
+
 @pytest.fixture(scope="session")
 def qt_app():
     """Start QApplication once for session, with WebEngine support."""
@@ -232,7 +243,7 @@ def qt_app():
 
         # --- EXTEND THE TEST HOOK TO BYPASS THE EVENTFILTER LOOP ---
         with patch.object(QuillPane, "_chat_input", create=True, new=MagicMock()):
-            pane = QuillPane(MockPad(), initial_page=0)
+            _pane = QuillPane(MockPad(), initial_page=0)
 
 
 def test_terminal_bridge_basic(qt_app):

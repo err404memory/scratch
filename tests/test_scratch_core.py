@@ -121,6 +121,23 @@ def test_ollama_chat_payload_can_request_keep_alive():
     assert payload["stream"] is True
 
 
+def test_ollama_loaded_model_names_reads_name_and_model_fields():
+    payload = {
+        "models": [
+            {"name": "dark-mistress:latest", "model": "dark-mistress:latest"},
+            {"model": "other:latest"},
+            "bad-entry",
+        ]
+    }
+
+    assert scratch_core.ollama_loaded_model_names(payload) == [
+        "dark-mistress:latest",
+        "other:latest",
+    ]
+    assert scratch_core.ollama_model_is_loaded(payload, "dark-mistress:latest") is True
+    assert scratch_core.ollama_model_is_loaded(payload, "missing:latest") is False
+
+
 def test_migrate_notes_converts_plain_text_pages_only():
     calls: list[str] = []
 

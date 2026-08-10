@@ -1,9 +1,8 @@
-import json
 import types
 from unittest.mock import MagicMock, patch
-import pytest
 
 from scratch import ScratchPad
+
 
 def test_send_to_ollama_worker_logic():
     """
@@ -31,7 +30,7 @@ def test_send_to_ollama_worker_logic():
          patch("scratch.ollama_stream_chunks") as mock_stream, \
          patch("scratch.ollama_chat_stream_chunks") as mock_chat_stream, \
          patch("scratch.threading.Thread") as mock_thread_class:
-        
+
         # Simulate text chunks coming out of your custom parser functions
         mock_stream.return_value = ["AI", " Response"]
         mock_chat_stream.return_value = ["AI", " Response"]
